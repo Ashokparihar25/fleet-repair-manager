@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { CheckCircle2, Loader2, Upload, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { createVehicleFromVin, saveInvoice } from "@/app/actions/fleet";
+import { isEmptyExtraction } from "@/lib/ocr/quality";
 import { normalizeVin, isValidVin, vinValidationError } from "@/lib/vin";
 import type { OcrExtractionResult, RepairShop, Vehicle } from "@/types";
 import { Button } from "@/components/ui/button";
@@ -52,6 +53,11 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
     return vehicles.find((v) => v.vin === vin) ?? null;
   }, [extraction, vehicles]);
 
+  const extractedVin = useMemo(
+    () => normalizeVin(extraction?.invoice.vin || extraction?.vehicle.vin || ""),
+    [extraction],
+  );
+
   const shopMatch = useMemo(() => {
     const name = extraction?.repair_shop.name?.toLowerCase();
     if (!name) return shops[0] ?? null;
@@ -64,6 +70,10 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
     if (match) {
       setSelectedVehicleId(match.id);
       setCreateNewVehicle(false);
+    } else if (vin && isValidVin(vin)) {
+      // Auto-create path when OCR found a VIN that is not in the fleet yet.
+      setSelectedVehicleId("");
+      setCreateNewVehicle(true);
     } else {
       setSelectedVehicleId("");
       setCreateNewVehicle(false);
@@ -109,15 +119,18 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
 
       if (extractions.length <= 1) {
         const extraction = extractions[0];
+        const empty = isEmptyExtraction(extraction);
         update(id, {
           status: "review",
           extraction,
-          warning: ocr.warning,
+          warning: ocr.warning || (empty ? "OCR returned little/no data for this page. Fill fields manually or re-upload a clearer scan." : undefined),
           message: extraction?.invoice.invoice_number
             ? `#${extraction.invoice.invoice_number}`
-            : ocr.needs_review
-              ? "Needs review"
-              : "Extracted",
+            : empty
+              ? "Empty — needs review"
+              : ocr.needs_review
+                ? "Needs review"
+                : "Extracted",
         });
         setActiveId((current) => current ?? id);
         return;
@@ -127,18 +140,23 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
         const idx = q.findIndex((i) => i.id === id);
         if (idx < 0) return q;
         const base = q[idx];
-        const expanded: QueueItem[] = extractions.map((extraction, i) => ({
-          id: `${id}-p${i + 1}`,
-          file: base.file,
-          status: "review",
-          page: i + 1,
-          upload: base.upload ?? up,
-          extraction,
-          warning: ocr.warnings?.[i] || (i === 0 ? ocr.warning : undefined),
-          message: extraction.invoice.invoice_number
-            ? `#${extraction.invoice.invoice_number} · page ${i + 1}`
-            : `Page ${i + 1} · needs review`,
-        }));
+        const expanded: QueueItem[] = extractions.map((extraction, i) => {
+          const empty = isEmptyExtraction(extraction);
+          return {
+            id: `${id}-p${i + 1}`,
+            file: base.file,
+            status: "review",
+            page: i + 1,
+            upload: base.upload ?? up,
+            extraction,
+            warning: ocr.warnings?.[i] || (i === 0 ? ocr.warning : undefined) || (empty ? "Little/no data on this page — enter VIN and fields manually if this is a real invoice." : undefined),
+            message: extraction.invoice.invoice_number
+              ? `#${extraction.invoice.invoice_number} · page ${i + 1}`
+              : empty
+                ? `Page ${i + 1} · empty`
+                : `Page ${i + 1} · needs review`,
+          };
+        });
         return [...q.slice(0, idx), ...expanded, ...q.slice(idx + 1)];
       });
       setActiveId(`${id}-p1`);
@@ -158,8 +176,12 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
     try {
       let vehicleId = String(fd.get("vehicle_id") || selectedVehicleId || "");
       const vin = normalizeVin(String(fd.get("vin") || "")) || "";
-      if (!vehicleId && createNewVehicle) {
-        if (!vin) throw new Error("VIN is required to create a new vehicle.");
+      if (!vehicleId && vin) {
+        const match = vehicles.find((v) => v.vin === vin);
+        if (match) vehicleId = match.id;
+      }
+      // Auto-create when VIN is present (checkbox default ON for new VINs).
+      if (!vehicleId && vin && (createNewVehicle || isValidVin(vin))) {
         if (!isValidVin(vin)) {
           throw new Error(vinValidationError(vin) || "Invalid VIN.");
         }
@@ -176,12 +198,11 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
         vehicleId = created.id;
       }
       if (!vehicleId) {
-        // Last chance: match normalized VIN against loaded vehicles
-        const match = vin ? vehicles.find((v) => v.vin === vin) : null;
-        if (match) vehicleId = match.id;
-      }
-      if (!vehicleId) {
-        throw new Error("Vehicle not found — create a new vehicle or select an existing vehicle.");
+        throw new Error(
+          vin
+            ? "Vehicle not found — enable “Create new vehicle from extracted VIN” or select an existing vehicle."
+            : "No VIN extracted. Enter a VIN, create a new vehicle, or select an existing vehicle.",
+        );
       }
 
       const parts = collectRepeating(fd, "part_description", ["part_number", "quantity", "unit_price", "extended_price"]);
@@ -330,12 +351,20 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
                   {vinMatch.vehicle_id ?? "No fleet ID"} · {vinMatch.year} {vinMatch.make} {vinMatch.model} · {vinMatch.vin}
                 </AlertDescription>
               </Alert>
+            ) : extractedVin && isValidVin(extractedVin) ? (
+              <Alert variant="success">
+                <CheckCircle2 className="h-4 w-4" />
+                <AlertTitle>New VIN ready to save</AlertTitle>
+                <AlertDescription>
+                  VIN {extractedVin} was not in the fleet. “Create new vehicle” is checked — Confirm & save will add it automatically.
+                </AlertDescription>
+              </Alert>
             ) : (
               <Alert variant="warning">
                 <AlertTriangle className="h-4 w-4" />
-                <AlertTitle>Vehicle not found — create new vehicle or select existing vehicle.</AlertTitle>
+                <AlertTitle>No VIN matched — enter VIN or select a vehicle</AlertTitle>
                 <AlertDescription>
-                  VIN is the matching key. A duplicate vehicle will never be created if the VIN already exists.
+                  OCR did not find a usable VIN on this page. Paste the VIN from the PDF, then save (a new vehicle will be created automatically).
                 </AlertDescription>
               </Alert>
             )}

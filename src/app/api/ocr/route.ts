@@ -3,6 +3,8 @@ import { OCR_SYSTEM_PROMPT } from "@/lib/ocr/prompt";
 import { emptyExtraction, normalizeExtraction } from "@/lib/ocr/parse";
 import { parseLalaInvoice } from "@/lib/ocr/lala-parser";
 import { canRunLocalOcr, rasterizePdf, runLocalOcr } from "@/lib/ocr/local";
+import { isEmptyExtraction } from "@/lib/ocr/quality";
+import { splitPdfToPageBuffers } from "@/lib/ocr/split-pdf";
 import type { OcrExtractionResult } from "@/types";
 
 export const runtime = "nodejs";
@@ -23,7 +25,7 @@ function payload(
   extra: Partial<OcrResponse> = {},
 ): OcrResponse {
   const list = extractions.length ? extractions : [emptyExtraction()];
-  const needs = list.some((e) => e.overall_confidence < 80) || Boolean(extra.warning);
+  const needs = list.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || Boolean(extra.warning);
   return {
     extraction: list[0],
     extractions: list,
@@ -53,11 +55,13 @@ async function geminiExtract(
   apiKey: string,
   bytes: Buffer,
   mime: string,
+  opts: { singlePage?: boolean } = {},
 ): Promise<{ extractions: OcrExtractionResult[]; warning?: string }> {
   const model = process.env.OCR_GEMINI_MODEL || "gemini-2.5-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const multiPageHint =
-    mime.includes("pdf")
+  const multiPageHint = opts.singlePage
+    ? "This file is a single invoice page. Return ONE invoice JSON object only — never an array of empty stubs."
+    : mime.includes("pdf")
       ? "If this PDF has multiple invoice pages, return JSON {\"invoices\":[...]} with one object per invoice/page. Otherwise return a single invoice object."
       : "Extract all invoice data from this image as a single invoice JSON object.";
 
@@ -68,7 +72,7 @@ async function geminiExtract(
         role: "user",
         parts: [
           {
-            text: `${multiPageHint} Keep parts and labor as separate arrays. Do not guess missing values.`,
+            text: `${multiPageHint} Keep parts and labor as separate arrays. Do not guess missing values. Always extract VIN when printed.`,
           },
           { inline_data: { mime_type: mime, data: bytes.toString("base64") } },
         ],
@@ -96,13 +100,68 @@ async function geminiExtract(
   };
   const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("\n") ?? "";
   try {
-    return { extractions: parseGeminiJson(text) };
+    const extractions = parseGeminiJson(text);
+    // For single-page calls, keep the first non-empty result (or first if all empty).
+    if (opts.singlePage && extractions.length > 1) {
+      const filled = extractions.find((e) => !isEmptyExtraction(e));
+      return { extractions: [filled ?? extractions[0]] };
+    }
+    return { extractions };
   } catch {
     return {
       extractions: [emptyExtraction()],
       warning: "OCR returned unparseable output. Needs verification.",
     };
   }
+}
+
+async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+async function geminiExtractPdfByPage(
+  apiKey: string,
+  bytes: Buffer,
+): Promise<{ extractions: OcrExtractionResult[]; warning?: string; warnings: string[] }> {
+  const pageBuffers = await splitPdfToPageBuffers(bytes);
+  if (pageBuffers.length === 1) {
+    const one = await geminiExtract(apiKey, pageBuffers[0], "application/pdf", { singlePage: true });
+    return { extractions: one.extractions, warning: one.warning, warnings: one.warning ? [one.warning] : [] };
+  }
+
+  const concurrency = Math.max(1, Math.min(3, Number(process.env.OCR_PAGE_CONCURRENCY || 3)));
+  const results = await mapPool(pageBuffers, concurrency, async (pageBytes, i) => {
+    const r = await geminiExtract(apiKey, pageBytes, "application/pdf", { singlePage: true });
+    return { page: i + 1, ...r };
+  });
+
+  const extractions = results.map((r) => r.extractions[0] ?? emptyExtraction());
+  const warnings = results
+    .map((r) => (r.warning ? `Page ${r.page}: ${r.warning}` : isEmptyExtraction(r.extractions[0]) ? `Page ${r.page}: little/no invoice data extracted` : null))
+    .filter((w): w is string => Boolean(w));
+
+  const emptyCount = extractions.filter((e) => isEmptyExtraction(e)).length;
+  const warning =
+    warnings[0] ||
+    (emptyCount
+      ? `Split into ${pageBuffers.length} pages; ${emptyCount} need manual review (weak/empty OCR).`
+      : `Split into ${pageBuffers.length} invoice pages for OCR.`);
+
+  return { extractions, warning, warnings };
 }
 
 export async function POST(req: Request) {
@@ -119,14 +178,13 @@ export async function POST(req: Request) {
 
   try {
     if (apiKey) {
-      // On Vercel, send PDF/images straight to Gemini (no local Python rasterizer).
-      // On a Mac with Python, optionally rasterize PDFs page-by-page for higher accuracy.
+      // Prefer page-by-page: local rasterize when Python is available; otherwise split PDF with pdf-lib.
       if (isPdf && canRunLocalOcr()) {
         try {
           const pageBuffers = await rasterizePdf(bytes);
           const results = [];
           for (const page of pageBuffers) {
-            results.push(await geminiExtract(apiKey, page, "image/png"));
+            results.push(await geminiExtract(apiKey, page, "image/png", { singlePage: true }));
           }
           const extractions = results.flatMap((r) => r.extractions);
           const warnings = results.map((r) => r.warning).filter((w): w is string => Boolean(w));
@@ -135,20 +193,32 @@ export async function POST(req: Request) {
               engine: "gemini",
               warning: warnings[0],
               warnings,
-              needs_review: extractions.some((e) => e.overall_confidence < 80) || warnings.length > 0,
+              needs_review: extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || warnings.length > 0,
             }),
           );
         } catch {
-          // Fall through to direct PDF upload.
+          // Fall through to pdf-lib page split.
         }
       }
 
-      const { extractions, warning } = await geminiExtract(apiKey, bytes, mime);
+      if (isPdf) {
+        const { extractions, warning, warnings } = await geminiExtractPdfByPage(apiKey, bytes);
+        return NextResponse.json(
+          payload(extractions, {
+            engine: "gemini",
+            warning,
+            warnings,
+            needs_review: extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || Boolean(warning),
+          }),
+        );
+      }
+
+      const { extractions, warning } = await geminiExtract(apiKey, bytes, mime, { singlePage: true });
       return NextResponse.json(
         payload(extractions, {
           engine: "gemini",
           warning,
-          needs_review: extractions.some((e) => e.overall_confidence < 80) || Boolean(warning),
+          needs_review: extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || Boolean(warning),
         }),
       );
     }
