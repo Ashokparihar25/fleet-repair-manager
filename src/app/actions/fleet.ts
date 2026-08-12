@@ -7,7 +7,7 @@ import { mutateStore } from "@/lib/data/store";
 import { detectMileageAnomaly } from "@/lib/mileage";
 import { addMoney, money, parseMoneyInput } from "@/lib/money";
 import { newId } from "@/lib/ids";
-import { normalizeVin } from "@/lib/vin";
+import { normalizeVin, isValidVin, vinValidationError } from "@/lib/vin";
 import type {
   DocumentRecord,
   FleetClient,
@@ -108,6 +108,11 @@ export async function importClientVehicles(input: { client_id: string; vehicles:
       const vin = row.vin ? normalizeVin(row.vin) : null;
       const fleetId = row.fleet_id?.trim() || null;
       if (!vin && !fleetId && !row.license_plate && !row.make && !row.model) {
+        result.skipped += 1;
+        continue;
+      }
+      if (vin && !isValidVin(vin)) {
+        result.errors.push(`VIN ${row.vin} is not a valid 17-character VIN — skipped.`);
         result.skipped += 1;
         continue;
       }
@@ -213,6 +218,9 @@ export async function saveVehicle(formData: FormData) {
   const id = String(formData.get("id") || newId());
   const vinRaw = String(formData.get("vin") || "").trim();
   const vin = vinRaw ? normalizeVin(vinRaw) : null;
+  if (vinRaw && !isValidVin(vin)) {
+    throw new Error(vinValidationError(vinRaw) || "Invalid VIN.");
+  }
   const clientId = String(formData.get("client_id") || "").trim() || null;
 
   await mutateStore((store) => {
@@ -617,6 +625,9 @@ export async function createVehicleFromVin(input: {
   await requireWriter();
   const vin = normalizeVin(input.vin);
   if (!vin) throw new Error("VIN is required to create a vehicle.");
+  if (!isValidVin(vin)) {
+    throw new Error(vinValidationError(input.vin) || "Invalid VIN.");
+  }
   let id = "";
   await mutateStore((store) => {
     const existing = store.vehicles.find((v) => v.vin === vin);

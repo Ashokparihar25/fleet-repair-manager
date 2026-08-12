@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { CheckCircle2, Loader2, Upload, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { createVehicleFromVin, saveInvoice } from "@/app/actions/fleet";
-import { normalizeVin } from "@/lib/vin";
+import { normalizeVin, isValidVin, vinValidationError } from "@/lib/vin";
 import type { OcrExtractionResult, RepairShop, Vehicle } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -157,9 +157,12 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
     update(active.id, { status: "saving" });
     try {
       let vehicleId = String(fd.get("vehicle_id") || selectedVehicleId || "");
-      const vin = String(fd.get("vin") || "").trim();
+      const vin = normalizeVin(String(fd.get("vin") || "")) || "";
       if (!vehicleId && createNewVehicle) {
         if (!vin) throw new Error("VIN is required to create a new vehicle.");
+        if (!isValidVin(vin)) {
+          throw new Error(vinValidationError(vin) || "Invalid VIN.");
+        }
         const created = await createVehicleFromVin({
           vin,
           year: fd.get("year") ? Number(fd.get("year")) : null,
@@ -171,6 +174,11 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
           mileage: fd.get("odometer_in") ? Number(fd.get("odometer_in")) : null,
         });
         vehicleId = created.id;
+      }
+      if (!vehicleId) {
+        // Last chance: match normalized VIN against loaded vehicles
+        const match = vin ? vehicles.find((v) => v.vin === vin) : null;
+        if (match) vehicleId = match.id;
       }
       if (!vehicleId) {
         throw new Error("Vehicle not found — create a new vehicle or select an existing vehicle.");
