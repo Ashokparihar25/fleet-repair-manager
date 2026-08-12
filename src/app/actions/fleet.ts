@@ -442,9 +442,9 @@ export async function saveInvoice(input: SaveInvoiceInput) {
       ocr_confidence: input.ocr_confidence ?? prev?.ocr_confidence ?? null,
       ocr_payload: input.ocr_payload ?? prev?.ocr_payload ?? null,
       manually_verified: input.manually_verified ?? true,
-      verified_by: input.manually_verified ? session.id || null : prev?.verified_by ?? null,
-      verified_at: input.manually_verified ? new Date().toISOString() : prev?.verified_at ?? null,
-      created_by: prev?.created_by ?? session.id || null,
+      verified_by: input.manually_verified ? session.id || null : (prev?.verified_by ?? null),
+      verified_at: input.manually_verified ? new Date().toISOString() : (prev?.verified_at ?? null),
+      created_by: prev?.created_by ?? (session.id || null),
       created_at: prev?.created_at ?? new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };

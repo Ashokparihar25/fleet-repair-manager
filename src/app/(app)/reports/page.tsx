@@ -3,6 +3,7 @@ import { categoryLabel } from "@/lib/categorize";
 import { getStore } from "@/lib/data/queries";
 import { addMoney, formatMoney } from "@/lib/money";
 import { formatDate } from "@/lib/utils";
+import Link from "next/link";
 import { PageHeader } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -260,18 +261,18 @@ export default async function ReportsPage({
               const shopInvs = invs.filter((i) => i.repair_shop_id === shop.id);
               return (
                 <div key={shop.id} className="flex justify-between border-b py-1">
-                  <a href={`/shops/${shop.id}`} className="text-primary hover:underline">
+                  <Link href={`/shops/${shop.id}`} className="text-primary hover:underline">
                     {shop.name}
-                  </a>
+                  </Link>
                   <span>
                     {shopInvs.length} inv · {formatMoney(addMoney(...shopInvs.map(invoiceSpend)))}
                   </span>
                 </div>
               );
             })}
-            <a href="/shops/compare" className="block pt-2 text-primary hover:underline">
+            <Link href="/shops/compare" className="block pt-2 text-primary hover:underline">
               Compare shops →
-            </a>
+            </Link>
           </CardContent>
         </Card>
         <Card id="report-monthly" className="xl:col-span-2">
