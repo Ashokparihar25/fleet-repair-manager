@@ -19,7 +19,7 @@ export default async function UploadInvoicePage() {
       <PageHeader
         crumbs={[{ href: "/invoices", label: "Invoices" }, { label: "Upload" }]}
         title="Upload invoices"
-        description="Store the original PDF/image, OCR extract parts and labor separately, match VIN, then verify before saving. Already-saved invoice numbers are flagged so you can skip them."
+        description="Large PDFs upload straight to Storage (bypasses host size limits). OCR runs page-by-page; already-saved invoice numbers can be skipped."
       />
       <UploadWorkflow vehicles={store.vehicles} shops={store.repair_shops} existingInvoices={existingInvoices} />
     </div>

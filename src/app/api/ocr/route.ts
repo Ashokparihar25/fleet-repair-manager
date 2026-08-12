@@ -1,3 +1,5 @@
+import { readFile } from "fs/promises";
+import path from "path";
 import { NextResponse } from "next/server";
 import { OCR_SYSTEM_PROMPT } from "@/lib/ocr/prompt";
 import { emptyExtraction, normalizeExtraction } from "@/lib/ocr/parse";
@@ -5,6 +7,8 @@ import { parseLalaInvoice } from "@/lib/ocr/lala-parser";
 import { canRunLocalOcr, rasterizePdf, runLocalOcr } from "@/lib/ocr/local";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
 import { splitPdfToPageBuffers } from "@/lib/ocr/split-pdf";
+import { isUsingSupabase } from "@/lib/supabase/config";
+import { requireAdminSupabase } from "@/lib/supabase/admin";
 import type { OcrExtractionResult } from "@/types";
 
 export const runtime = "nodejs";
@@ -164,21 +168,31 @@ async function geminiExtractPdfByPage(
   return { extractions, warning, warnings };
 }
 
-export async function POST(req: Request) {
-  const form = await req.formData();
-  const file = form.get("file");
-  if (!(file instanceof File)) {
-    return NextResponse.json({ error: "file is required" }, { status: 400 });
+async function loadBytesFromStorage(filePath: string): Promise<Buffer> {
+  if (isUsingSupabase()) {
+    const admin = requireAdminSupabase();
+    const { data, error } = await admin.storage.from("invoice-documents").download(filePath);
+    if (error || !data) {
+      throw new Error(error?.message || "Could not download file from Storage for OCR.");
+    }
+    return Buffer.from(await data.arrayBuffer());
   }
+  const full = path.join(process.cwd(), ".data", "uploads", filePath);
+  return readFile(full);
+}
 
-  const bytes = Buffer.from(await file.arrayBuffer());
-  const isPdf = (file.type || "").includes("pdf") || file.name.toLowerCase().endsWith(".pdf");
-  const mime = isPdf ? "application/pdf" : file.type || "image/png";
+async function runOcrOnBytes(input: {
+  bytes: Buffer;
+  fileName: string;
+  mime: string;
+}): Promise<NextResponse> {
+  const { bytes, fileName, mime } = input;
+  const isPdf = mime.includes("pdf") || fileName.toLowerCase().endsWith(".pdf");
+  const resolvedMime = isPdf ? "application/pdf" : mime || "image/png";
   const apiKey = process.env.GEMINI_API_KEY?.trim();
 
   try {
     if (apiKey) {
-      // Prefer page-by-page: local rasterize when Python is available; otherwise split PDF with pdf-lib.
       if (isPdf && canRunLocalOcr()) {
         try {
           const pageBuffers = await rasterizePdf(bytes);
@@ -213,7 +227,7 @@ export async function POST(req: Request) {
         );
       }
 
-      const { extractions, warning } = await geminiExtract(apiKey, bytes, mime, { singlePage: true });
+      const { extractions, warning } = await geminiExtract(apiKey, bytes, resolvedMime, { singlePage: true });
       return NextResponse.json(
         payload(extractions, {
           engine: "gemini",
@@ -234,7 +248,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const local = await runLocalOcr(bytes, { filename: file.name, mime });
+    const local = await runLocalOcr(bytes, { filename: fileName, mime: resolvedMime });
     if (!local.pages.length) {
       return NextResponse.json(
         payload([emptyExtraction()], {
@@ -271,4 +285,46 @@ export async function POST(req: Request) {
       }),
     );
   }
+}
+
+export async function POST(req: Request) {
+  const contentType = req.headers.get("content-type") || "";
+
+  // Preferred on Vercel: JSON with Storage path (no giant request body).
+  if (contentType.includes("application/json")) {
+    const body = (await req.json().catch(() => null)) as {
+      file_path?: string;
+      file_name?: string;
+      file_type?: string;
+    } | null;
+    const filePath = body?.file_path?.trim();
+    if (!filePath) {
+      return NextResponse.json({ error: "file_path is required" }, { status: 400 });
+    }
+    try {
+      const bytes = await loadBytesFromStorage(filePath);
+      const fileName = body?.file_name || path.basename(filePath);
+      const mime = body?.file_type || (fileName.toLowerCase().endsWith(".pdf") ? "application/pdf" : "application/octet-stream");
+      return runOcrOnBytes({ bytes, fileName, mime });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "OCR failed";
+      return NextResponse.json(
+        payload([emptyExtraction()], {
+          engine: "none",
+          warning: `OCR failed (${message}).`,
+          needs_review: true,
+        }),
+      );
+    }
+  }
+
+  const form = await req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) {
+    return NextResponse.json({ error: "file is required" }, { status: 400 });
+  }
+
+  const bytes = Buffer.from(await file.arrayBuffer());
+  const mime = file.type || "application/octet-stream";
+  return runOcrOnBytes({ bytes, fileName: file.name, mime });
 }

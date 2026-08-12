@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { createVehicleFromVin, saveInvoice } from "@/app/actions/fleet";
 import { findOcrDuplicate, type InvoiceDupCandidate } from "@/lib/duplicates";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
+import { parseApiJson, uploadInvoiceFile } from "@/lib/upload-client";
 import { normalizeVin, isValidVin, vinValidationError } from "@/lib/vin";
 import type { OcrExtractionResult, RepairShop, Vehicle } from "@/types";
 import { Button } from "@/components/ui/button";
@@ -188,17 +189,29 @@ export function UploadWorkflow({
   async function processOne(id: string, file: File) {
     update(id, { status: "uploading" });
     try {
-      const fd = new FormData();
-      fd.set("file", file);
-      const upRes = await fetch("/api/upload", { method: "POST", body: fd });
-      const up = await upRes.json();
-      if (!upRes.ok) throw new Error(up.error || "Upload failed");
+      // Direct-to-Storage on hosted Supabase so large PDFs bypass Vercel’s ~4.5MB body limit.
+      const up = await uploadInvoiceFile(file);
       update(id, { status: "extracting", upload: up });
 
-      const ocrFd = new FormData();
-      ocrFd.set("file", file);
-      const ocrRes = await fetch("/api/ocr", { method: "POST", body: ocrFd });
-      const ocr = await ocrRes.json();
+      const ocrRes = await fetch("/api/ocr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file_path: up.file_path,
+          file_name: up.file_name,
+          file_type: up.file_type,
+        }),
+      });
+      const ocr = await parseApiJson<{
+        extractions?: OcrExtractionResult[];
+        extraction?: OcrExtractionResult;
+        warning?: string;
+        warnings?: string[];
+        needs_review?: boolean;
+        error?: string;
+      }>(ocrRes);
+      if (!ocrRes.ok && ocr.error) throw new Error(ocr.error);
+
       const extractions: OcrExtractionResult[] =
         Array.isArray(ocr.extractions) && ocr.extractions.length
           ? ocr.extractions
