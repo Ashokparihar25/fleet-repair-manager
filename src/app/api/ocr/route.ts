@@ -1,12 +1,11 @@
 import { readFile } from "fs/promises";
 import path from "path";
 import { NextResponse } from "next/server";
-import { OCR_SYSTEM_PROMPT } from "@/lib/ocr/prompt";
-import { emptyExtraction, normalizeExtraction } from "@/lib/ocr/parse";
+import { emptyExtraction } from "@/lib/ocr/parse";
 import { parseLalaInvoice } from "@/lib/ocr/lala-parser";
+import { geminiExtractInline, geminiExtractPdfByPage } from "@/lib/ocr/gemini";
 import { canRunLocalOcr, rasterizePdf, runLocalOcr } from "@/lib/ocr/local";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
-import { splitPdfToPageBuffers } from "@/lib/ocr/split-pdf";
 import { isUsingSupabase } from "@/lib/supabase/config";
 import { requireAdminSupabase } from "@/lib/supabase/admin";
 import type { OcrExtractionResult } from "@/types";
@@ -41,133 +40,6 @@ function payload(
   };
 }
 
-function parseGeminiJson(text: string): OcrExtractionResult[] {
-  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
-  const raw = JSON.parse(cleaned) as unknown;
-  if (Array.isArray(raw)) return raw.map((item) => normalizeExtraction(item));
-  if (raw && typeof raw === "object") {
-    const obj = raw as Record<string, unknown>;
-    if (Array.isArray(obj.invoices)) return obj.invoices.map((item) => normalizeExtraction(item));
-    if (Array.isArray(obj.extractions)) return obj.extractions.map((item) => normalizeExtraction(item));
-    if (Array.isArray(obj.pages)) return obj.pages.map((item) => normalizeExtraction(item));
-    return [normalizeExtraction(raw)];
-  }
-  return [emptyExtraction()];
-}
-
-async function geminiExtract(
-  apiKey: string,
-  bytes: Buffer,
-  mime: string,
-  opts: { singlePage?: boolean } = {},
-): Promise<{ extractions: OcrExtractionResult[]; warning?: string }> {
-  const model = process.env.OCR_GEMINI_MODEL || "gemini-2.5-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const multiPageHint = opts.singlePage
-    ? "This file is a single invoice page. Return ONE invoice JSON object only — never an array of empty stubs."
-    : mime.includes("pdf")
-      ? "If this PDF has multiple invoice pages, return JSON {\"invoices\":[...]} with one object per invoice/page. Otherwise return a single invoice object."
-      : "Extract all invoice data from this image as a single invoice JSON object.";
-
-  const body = {
-    system_instruction: { parts: [{ text: OCR_SYSTEM_PROMPT }] },
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: `${multiPageHint} Keep parts and labor as separate arrays. Do not guess missing values. Always extract VIN when printed.`,
-          },
-          { inline_data: { mime_type: mime, data: bytes.toString("base64") } },
-        ],
-      },
-    ],
-    generationConfig: { temperature: 0.1, responseMimeType: "application/json" },
-  };
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    return {
-      extractions: [emptyExtraction()],
-      warning: `OCR provider error: ${text.slice(0, 400)}`,
-    };
-  }
-
-  const json = (await res.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-  };
-  const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("\n") ?? "";
-  try {
-    const extractions = parseGeminiJson(text);
-    // For single-page calls, keep the first non-empty result (or first if all empty).
-    if (opts.singlePage && extractions.length > 1) {
-      const filled = extractions.find((e) => !isEmptyExtraction(e));
-      return { extractions: [filled ?? extractions[0]] };
-    }
-    return { extractions };
-  } catch {
-    return {
-      extractions: [emptyExtraction()],
-      warning: "OCR returned unparseable output. Needs verification.",
-    };
-  }
-}
-
-async function mapPool<T, R>(
-  items: T[],
-  concurrency: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await fn(items[i], i);
-    }
-  }
-  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
-  await Promise.all(workers);
-  return results;
-}
-
-async function geminiExtractPdfByPage(
-  apiKey: string,
-  bytes: Buffer,
-): Promise<{ extractions: OcrExtractionResult[]; warning?: string; warnings: string[] }> {
-  const pageBuffers = await splitPdfToPageBuffers(bytes);
-  if (pageBuffers.length === 1) {
-    const one = await geminiExtract(apiKey, pageBuffers[0], "application/pdf", { singlePage: true });
-    return { extractions: one.extractions, warning: one.warning, warnings: one.warning ? [one.warning] : [] };
-  }
-
-  const concurrency = Math.max(1, Math.min(3, Number(process.env.OCR_PAGE_CONCURRENCY || 3)));
-  const results = await mapPool(pageBuffers, concurrency, async (pageBytes, i) => {
-    const r = await geminiExtract(apiKey, pageBytes, "application/pdf", { singlePage: true });
-    return { page: i + 1, ...r };
-  });
-
-  const extractions = results.map((r) => r.extractions[0] ?? emptyExtraction());
-  const warnings = results
-    .map((r) => (r.warning ? `Page ${r.page}: ${r.warning}` : isEmptyExtraction(r.extractions[0]) ? `Page ${r.page}: little/no invoice data extracted` : null))
-    .filter((w): w is string => Boolean(w));
-
-  const emptyCount = extractions.filter((e) => isEmptyExtraction(e)).length;
-  const warning =
-    warnings[0] ||
-    (emptyCount
-      ? `Split into ${pageBuffers.length} pages; ${emptyCount} need manual review (weak/empty OCR).`
-      : `Split into ${pageBuffers.length} invoice pages for OCR.`);
-
-  return { extractions, warning, warnings };
-}
-
 async function loadBytesFromStorage(filePath: string): Promise<Buffer> {
   if (isUsingSupabase()) {
     const admin = requireAdminSupabase();
@@ -198,7 +70,7 @@ async function runOcrOnBytes(input: {
           const pageBuffers = await rasterizePdf(bytes);
           const results = [];
           for (const page of pageBuffers) {
-            results.push(await geminiExtract(apiKey, page, "image/png", { singlePage: true }));
+            results.push(await geminiExtractInline(apiKey, page, "image/png", { singlePage: true }));
           }
           const extractions = results.flatMap((r) => r.extractions);
           const warnings = results.map((r) => r.warning).filter((w): w is string => Boolean(w));
@@ -211,7 +83,7 @@ async function runOcrOnBytes(input: {
             }),
           );
         } catch {
-          // Fall through to pdf-lib page split.
+          // Fall through to Files API / pdf-lib path.
         }
       }
 
@@ -227,7 +99,7 @@ async function runOcrOnBytes(input: {
         );
       }
 
-      const { extractions, warning } = await geminiExtract(apiKey, bytes, resolvedMime, { singlePage: true });
+      const { extractions, warning } = await geminiExtractInline(apiKey, bytes, resolvedMime, { singlePage: true });
       return NextResponse.json(
         payload(extractions, {
           engine: "gemini",
@@ -290,7 +162,6 @@ async function runOcrOnBytes(input: {
 export async function POST(req: Request) {
   const contentType = req.headers.get("content-type") || "";
 
-  // Preferred on Vercel: JSON with Storage path (no giant request body).
   if (contentType.includes("application/json")) {
     const body = (await req.json().catch(() => null)) as {
       file_path?: string;
@@ -304,7 +175,9 @@ export async function POST(req: Request) {
     try {
       const bytes = await loadBytesFromStorage(filePath);
       const fileName = body?.file_name || path.basename(filePath);
-      const mime = body?.file_type || (fileName.toLowerCase().endsWith(".pdf") ? "application/pdf" : "application/octet-stream");
+      const mime =
+        body?.file_type ||
+        (fileName.toLowerCase().endsWith(".pdf") ? "application/pdf" : "application/octet-stream");
       return runOcrOnBytes({ bytes, fileName, mime });
     } catch (err) {
       const message = err instanceof Error ? err.message : "OCR failed";

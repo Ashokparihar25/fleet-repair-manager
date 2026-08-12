@@ -179,7 +179,7 @@ export function UploadWorkflow({
       message: invoiceNo
         ? `#${invoiceNo}${base.page ? ` · page ${base.page}` : ""}`
         : empty
-          ? `${base.page ? `Page ${base.page} · ` : ""}empty`
+          ? `${base.page ? `Page ${base.page} · ` : ""}empty${warning ? " · OCR issue" : ""}`
           : base.page
             ? `Page ${base.page} · needs review`
             : "Needs review",
