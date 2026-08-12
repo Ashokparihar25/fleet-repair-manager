@@ -1,0 +1,58 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+*.key
+*.p12
+*.pfx
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env / secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+*.local
+
+# local data store + uploads
+.data/
+
+# compiled local OCR helper
+scripts/bin/
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# vercel
+.vercel
+
+# supabase CLI local state (may include project refs)
+.supabase/
+supabase/.temp/
+supabase/.branches/
+
+# OS / editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
