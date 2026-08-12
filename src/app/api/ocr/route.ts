@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { OCR_SYSTEM_PROMPT } from "@/lib/ocr/prompt";
 import { emptyExtraction, normalizeExtraction } from "@/lib/ocr/parse";
 import { parseLalaInvoice } from "@/lib/ocr/lala-parser";
-import { rasterizePdf, runLocalOcr } from "@/lib/ocr/local";
+import { canRunLocalOcr, rasterizePdf, runLocalOcr } from "@/lib/ocr/local";
 import type { OcrExtractionResult } from "@/types";
 
 export const runtime = "nodejs";
@@ -35,20 +35,41 @@ function payload(
   };
 }
 
-async function geminiExtractPage(
+function parseGeminiJson(text: string): OcrExtractionResult[] {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
+  const raw = JSON.parse(cleaned) as unknown;
+  if (Array.isArray(raw)) return raw.map((item) => normalizeExtraction(item));
+  if (raw && typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    if (Array.isArray(obj.invoices)) return obj.invoices.map((item) => normalizeExtraction(item));
+    if (Array.isArray(obj.extractions)) return obj.extractions.map((item) => normalizeExtraction(item));
+    if (Array.isArray(obj.pages)) return obj.pages.map((item) => normalizeExtraction(item));
+    return [normalizeExtraction(raw)];
+  }
+  return [emptyExtraction()];
+}
+
+async function geminiExtract(
   apiKey: string,
   bytes: Buffer,
   mime: string,
-): Promise<{ extraction: OcrExtractionResult; warning?: string }> {
+): Promise<{ extractions: OcrExtractionResult[]; warning?: string }> {
   const model = process.env.OCR_GEMINI_MODEL || "gemini-2.5-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const multiPageHint =
+    mime.includes("pdf")
+      ? "If this PDF has multiple invoice pages, return JSON {\"invoices\":[...]} with one object per invoice/page. Otherwise return a single invoice object."
+      : "Extract all invoice data from this image as a single invoice JSON object.";
+
   const body = {
     system_instruction: { parts: [{ text: OCR_SYSTEM_PROMPT }] },
     contents: [
       {
         role: "user",
         parts: [
-          { text: "Extract all invoice data. Keep parts and labor as separate arrays. Do not guess." },
+          {
+            text: `${multiPageHint} Keep parts and labor as separate arrays. Do not guess missing values.`,
+          },
           { inline_data: { mime_type: mime, data: bytes.toString("base64") } },
         ],
       },
@@ -65,7 +86,7 @@ async function geminiExtractPage(
   if (!res.ok) {
     const text = await res.text();
     return {
-      extraction: emptyExtraction(),
+      extractions: [emptyExtraction()],
       warning: `OCR provider error: ${text.slice(0, 400)}`,
     };
   }
@@ -75,11 +96,10 @@ async function geminiExtractPage(
   };
   const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("\n") ?? "";
   try {
-    const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
-    return { extraction: normalizeExtraction(JSON.parse(cleaned)) };
+    return { extractions: parseGeminiJson(text) };
   } catch {
     return {
-      extraction: emptyExtraction(),
+      extractions: [emptyExtraction()],
       warning: "OCR returned unparseable output. Needs verification.",
     };
   }
@@ -93,28 +113,53 @@ export async function POST(req: Request) {
   }
 
   const bytes = Buffer.from(await file.arrayBuffer());
-  const mime = file.type || "application/pdf";
-  const apiKey = process.env.GEMINI_API_KEY;
+  const isPdf = (file.type || "").includes("pdf") || file.name.toLowerCase().endsWith(".pdf");
+  const mime = isPdf ? "application/pdf" : file.type || "image/png";
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
 
   try {
     if (apiKey) {
-      const pageBuffers =
-        mime.includes("pdf") || file.name.toLowerCase().endsWith(".pdf")
-          ? await rasterizePdf(bytes)
-          : [bytes];
-      const pageMime = pageBuffers.length > 1 || mime.includes("pdf") ? "image/png" : mime;
-      const results = [];
-      for (const page of pageBuffers) {
-        results.push(await geminiExtractPage(apiKey, page, pageMime));
+      // On Vercel, send PDF/images straight to Gemini (no local Python rasterizer).
+      // On a Mac with Python, optionally rasterize PDFs page-by-page for higher accuracy.
+      if (isPdf && canRunLocalOcr()) {
+        try {
+          const pageBuffers = await rasterizePdf(bytes);
+          const results = [];
+          for (const page of pageBuffers) {
+            results.push(await geminiExtract(apiKey, page, "image/png"));
+          }
+          const extractions = results.flatMap((r) => r.extractions);
+          const warnings = results.map((r) => r.warning).filter((w): w is string => Boolean(w));
+          return NextResponse.json(
+            payload(extractions, {
+              engine: "gemini",
+              warning: warnings[0],
+              warnings,
+              needs_review: extractions.some((e) => e.overall_confidence < 80) || warnings.length > 0,
+            }),
+          );
+        } catch {
+          // Fall through to direct PDF upload.
+        }
       }
-      const extractions = results.map((r) => r.extraction);
-      const warnings = results.map((r) => r.warning).filter((w): w is string => Boolean(w));
+
+      const { extractions, warning } = await geminiExtract(apiKey, bytes, mime);
       return NextResponse.json(
         payload(extractions, {
           engine: "gemini",
-          warning: warnings[0],
-          warnings,
-          needs_review: extractions.some((e) => e.overall_confidence < 80) || warnings.length > 0,
+          warning,
+          needs_review: extractions.some((e) => e.overall_confidence < 80) || Boolean(warning),
+        }),
+      );
+    }
+
+    if (!canRunLocalOcr()) {
+      return NextResponse.json(
+        payload([emptyExtraction()], {
+          engine: "none",
+          warning:
+            "Automatic OCR is not configured on this hosted site. Add GEMINI_API_KEY in Vercel → Project → Settings → Environment Variables, then redeploy. The original file was stored — fill the verification form manually for now.",
+          needs_review: true,
         }),
       );
     }
@@ -147,7 +192,7 @@ export async function POST(req: Request) {
       }),
     );
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Local OCR failed";
+    const message = err instanceof Error ? err.message : "OCR failed";
     return NextResponse.json(
       payload([emptyExtraction()], {
         engine: "none",

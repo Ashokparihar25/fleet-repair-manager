@@ -81,10 +81,17 @@ export default async function SettingsPage() {
           <CardHeader>
             <CardTitle>OCR</CardTitle>
           </CardHeader>
-          <CardContent className="text-sm text-muted-foreground">
-            Set <code>GEMINI_API_KEY</code> to enable automatic extraction from scanned PDFs/images. Without a key,
-            originals are still stored and the verification form is filled in manually. Source values are preserved
-            separately from normalized values.
+          <CardContent className="text-sm text-muted-foreground space-y-2">
+            <p>
+              Set <code>GEMINI_API_KEY</code> (local <code>.env.local</code> and Vercel env vars) to enable automatic
+              extraction from scanned PDFs/images.
+            </p>
+            <p>
+              On the live Vercel site, local Python OCR is not available — Gemini is required. Without a key, originals
+              are still stored and the verification form is filled in manually. Source values are preserved separately
+              from normalized values.
+            </p>
+            <Row label="GEMINI_API_KEY" value={process.env.GEMINI_API_KEY ? "Configured" : "Missing"} />
           </CardContent>
         </Card>
       </div>

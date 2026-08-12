@@ -35,10 +35,22 @@ function inferExt(filename: string, mime: string): string {
   return ".bin";
 }
 
+/** Local Python OCR only works on developer machines — not on Vercel/serverless. */
+export function canRunLocalOcr() {
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) return false;
+  if (process.env.DISABLE_LOCAL_OCR === "true") return false;
+  return true;
+}
+
 export async function runLocalOcr(
   bytes: Buffer,
   opts: { filename?: string; mime?: string; zoom?: number } = {},
 ): Promise<LocalOcrResult> {
+  if (!canRunLocalOcr()) {
+    throw new Error(
+      "Local Python OCR is not available in this environment. Set GEMINI_API_KEY for cloud OCR.",
+    );
+  }
   const dir = await mkdtemp(path.join(tmpdir(), "fleet-ocr-"));
   const ext = inferExt(opts.filename ?? "", opts.mime ?? "");
   const inputPath = path.join(dir, `input${ext || ".pdf"}`);
@@ -75,6 +87,9 @@ export async function runLocalOcr(
 }
 
 export async function rasterizePdf(bytes: Buffer, zoom = 2): Promise<Buffer[]> {
+  if (!canRunLocalOcr()) {
+    throw new Error("PDF rasterization requires local Python and is unavailable on Vercel.");
+  }
   const dir = await mkdtemp(path.join(tmpdir(), "fleet-raster-"));
   const inputPath = path.join(dir, "input.pdf");
   try {
