@@ -7,6 +7,7 @@ import { mutateStore } from "@/lib/data/store";
 import { detectMileageAnomaly } from "@/lib/mileage";
 import { addMoney, money, parseMoneyInput } from "@/lib/money";
 import { newId } from "@/lib/ids";
+import { findDuplicateInvoices } from "@/lib/duplicates";
 import { normalizeVin, isValidVin, vinValidationError } from "@/lib/vin";
 import type {
   DocumentRecord,
@@ -392,6 +393,8 @@ export interface SaveInvoiceInput {
     ocr_processed?: boolean;
     ocr_confidence?: number | null;
   } | null;
+  /** Set true only when the user explicitly confirms saving a known duplicate. */
+  allow_duplicate?: boolean;
 }
 
 export async function saveInvoice(input: SaveInvoiceInput) {
@@ -400,6 +403,32 @@ export async function saveInvoice(input: SaveInvoiceInput) {
 
   await mutateStore((store) => {
     const prev = store.invoices.find((i) => i.id === id);
+    if (!prev && !input.allow_duplicate) {
+      const vehicle = input.vehicle_id
+        ? store.vehicles.find((v) => v.id === input.vehicle_id)
+        : null;
+      const dups = findDuplicateInvoices(
+        {
+          id,
+          invoice_number: input.invoice_number?.trim() || null,
+          vehicle_id: input.vehicle_id || null,
+          repair_shop_id: input.repair_shop_id || null,
+          invoice_date: input.invoice_date || input.printed_date || input.work_completed_date || null,
+          invoice_total: money(input.invoice_total),
+          vin: vehicle?.vin ?? null,
+        },
+        store.invoices.map((inv) => ({
+          ...inv,
+          vin: store.vehicles.find((v) => v.id === inv.vehicle_id)?.vin ?? null,
+        })),
+      );
+      if (dups.length) {
+        const d = dups[0];
+        throw new Error(
+          `Invoice #${input.invoice_number ?? "—"} already exists as #${d.invoice_number ?? d.id.slice(0, 8)}. Skip it or open the existing invoice instead of saving again.`,
+        );
+      }
+    }
     const partsTotal =
       money(input.parts_total) ??
       addMoney(...input.parts.map((p) => p.extended_price));

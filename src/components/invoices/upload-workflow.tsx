@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useState, type ComponentProps } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { CheckCircle2, Loader2, Upload, AlertTriangle } from "lucide-react";
+import { CheckCircle2, Loader2, Upload, AlertTriangle, SkipForward } from "lucide-react";
 import { toast } from "sonner";
 import { createVehicleFromVin, saveInvoice } from "@/app/actions/fleet";
+import { findOcrDuplicate, type InvoiceDupCandidate } from "@/lib/duplicates";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
 import { normalizeVin, isValidVin, vinValidationError } from "@/lib/vin";
 import type { OcrExtractionResult, RepairShop, Vehicle } from "@/types";
@@ -16,7 +18,16 @@ import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { cn } from "@/lib/utils";
 
-type ItemStatus = "queued" | "uploading" | "extracting" | "review" | "saving" | "saved" | "error";
+type ItemStatus =
+  | "queued"
+  | "uploading"
+  | "extracting"
+  | "review"
+  | "duplicate"
+  | "saving"
+  | "saved"
+  | "skipped"
+  | "error";
 
 type QueueItem = {
   id: string;
@@ -27,6 +38,7 @@ type QueueItem = {
   upload?: { file_name: string; file_path: string; file_type: string; file_size: number };
   extraction?: OcrExtractionResult;
   warning?: string;
+  duplicateOf?: InvoiceDupCandidate | null;
 };
 
 function confClass(n: number | undefined) {
@@ -36,13 +48,46 @@ function confClass(n: number | undefined) {
   return "";
 }
 
-export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops: RepairShop[] }) {
+function matchShop(extraction: OcrExtractionResult | undefined, shops: RepairShop[]) {
+  const name = extraction?.repair_shop.name?.toLowerCase();
+  if (!name) return shops[0] ?? null;
+  return shops.find((s) => s.name.toLowerCase().includes(name) || name.includes(s.name.toLowerCase())) ?? shops[0] ?? null;
+}
+
+function detectDuplicate(
+  extraction: OcrExtractionResult | undefined,
+  shops: RepairShop[],
+  known: InvoiceDupCandidate[],
+): InvoiceDupCandidate | null {
+  if (!extraction) return null;
+  const shop = matchShop(extraction, shops);
+  return findOcrDuplicate({
+    invoiceNumber: extraction.invoice.invoice_number,
+    vin: normalizeVin(extraction.invoice.vin || extraction.vehicle.vin || ""),
+    repairShopId: shop?.id ?? null,
+    invoiceDate: extraction.invoice.printed_date || extraction.invoice.work_completed_date,
+    invoiceTotal: extraction.invoice.total,
+    existing: known,
+  });
+}
+
+export function UploadWorkflow({
+  vehicles,
+  shops,
+  existingInvoices,
+}: {
+  vehicles: Vehicle[];
+  shops: RepairShop[];
+  existingInvoices: InvoiceDupCandidate[];
+}) {
   const router = useRouter();
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [createNewVehicle, setCreateNewVehicle] = useState(false);
   const [selectedVehicleId, setSelectedVehicleId] = useState("");
   const [fleetId, setFleetId] = useState("");
+  const [sessionSaved, setSessionSaved] = useState<InvoiceDupCandidate[]>(existingInvoices);
+  const [forceSaveDuplicate, setForceSaveDuplicate] = useState(false);
 
   const active = queue.find((q) => q.id === activeId) ?? null;
   const extraction = active?.extraction;
@@ -58,20 +103,21 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
     [extraction],
   );
 
-  const shopMatch = useMemo(() => {
-    const name = extraction?.repair_shop.name?.toLowerCase();
-    if (!name) return shops[0] ?? null;
-    return shops.find((s) => s.name.toLowerCase().includes(name) || name.includes(s.name.toLowerCase())) ?? shops[0] ?? null;
-  }, [extraction, shops]);
+  const shopMatch = useMemo(() => matchShop(extraction, shops), [extraction, shops]);
+
+  const activeDuplicate = useMemo(() => {
+    if (active?.duplicateOf) return active.duplicateOf;
+    return detectDuplicate(extraction, shops, sessionSaved);
+  }, [active, extraction, shops, sessionSaved]);
 
   useEffect(() => {
+    setForceSaveDuplicate(false);
     const vin = normalizeVin(extraction?.invoice.vin || extraction?.vehicle.vin || "");
     const match = vin ? vehicles.find((v) => v.vin === vin) : null;
     if (match) {
       setSelectedVehicleId(match.id);
       setCreateNewVehicle(false);
     } else if (vin && isValidVin(vin)) {
-      // Auto-create path when OCR found a VIN that is not in the fleet yet.
       setSelectedVehicleId("");
       setCreateNewVehicle(true);
     } else {
@@ -97,6 +143,48 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
     }
   }
 
+  function buildReviewItem(
+    base: Pick<QueueItem, "id" | "file" | "upload" | "page">,
+    extraction: OcrExtractionResult | undefined,
+    warning: string | undefined,
+    known: InvoiceDupCandidate[],
+    seenInBatch: InvoiceDupCandidate[],
+  ): QueueItem {
+    const empty = isEmptyExtraction(extraction);
+    const dup = detectDuplicate(extraction, shops, [...known, ...seenInBatch]);
+    const invoiceNo = extraction?.invoice.invoice_number;
+    if (dup) {
+      return {
+        ...base,
+        status: "duplicate",
+        extraction,
+        warning,
+        duplicateOf: dup,
+        message: invoiceNo
+          ? `#${invoiceNo} already saved — skip`
+          : `Already saved as #${dup.invoice_number ?? dup.id.slice(0, 8)} — skip`,
+      };
+    }
+    return {
+      ...base,
+      status: "review",
+      extraction,
+      warning:
+        warning ||
+        (empty
+          ? "OCR returned little/no data for this page. Fill fields manually or re-upload a clearer scan."
+          : undefined),
+      duplicateOf: null,
+      message: invoiceNo
+        ? `#${invoiceNo}${base.page ? ` · page ${base.page}` : ""}`
+        : empty
+          ? `${base.page ? `Page ${base.page} · ` : ""}empty`
+          : base.page
+            ? `Page ${base.page} · needs review`
+            : "Needs review",
+    };
+  }
+
   async function processOne(id: string, file: File) {
     update(id, { status: "uploading" });
     try {
@@ -111,27 +199,22 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
       ocrFd.set("file", file);
       const ocrRes = await fetch("/api/ocr", { method: "POST", body: ocrFd });
       const ocr = await ocrRes.json();
-      const extractions: OcrExtractionResult[] = Array.isArray(ocr.extractions) && ocr.extractions.length
-        ? ocr.extractions
-        : ocr.extraction
-          ? [ocr.extraction]
-          : [];
+      const extractions: OcrExtractionResult[] =
+        Array.isArray(ocr.extractions) && ocr.extractions.length
+          ? ocr.extractions
+          : ocr.extraction
+            ? [ocr.extraction]
+            : [];
 
       if (extractions.length <= 1) {
-        const extraction = extractions[0];
-        const empty = isEmptyExtraction(extraction);
-        update(id, {
-          status: "review",
-          extraction,
-          warning: ocr.warning || (empty ? "OCR returned little/no data for this page. Fill fields manually or re-upload a clearer scan." : undefined),
-          message: extraction?.invoice.invoice_number
-            ? `#${extraction.invoice.invoice_number}`
-            : empty
-              ? "Empty — needs review"
-              : ocr.needs_review
-                ? "Needs review"
-                : "Extracted",
-        });
+        const item = buildReviewItem(
+          { id, file, upload: up },
+          extractions[0],
+          ocr.warning,
+          sessionSaved,
+          [],
+        );
+        update(id, item);
         setActiveId((current) => current ?? id);
         return;
       }
@@ -140,22 +223,32 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
         const idx = q.findIndex((i) => i.id === id);
         if (idx < 0) return q;
         const base = q[idx];
+        const batchSeen: InvoiceDupCandidate[] = [];
         const expanded: QueueItem[] = extractions.map((extraction, i) => {
-          const empty = isEmptyExtraction(extraction);
-          return {
-            id: `${id}-p${i + 1}`,
-            file: base.file,
-            status: "review",
-            page: i + 1,
-            upload: base.upload ?? up,
+          const item = buildReviewItem(
+            {
+              id: `${id}-p${i + 1}`,
+              file: base.file,
+              upload: base.upload ?? up,
+              page: i + 1,
+            },
             extraction,
-            warning: ocr.warnings?.[i] || (i === 0 ? ocr.warning : undefined) || (empty ? "Little/no data on this page — enter VIN and fields manually if this is a real invoice." : undefined),
-            message: extraction.invoice.invoice_number
-              ? `#${extraction.invoice.invoice_number} · page ${i + 1}`
-              : empty
-                ? `Page ${i + 1} · empty`
-                : `Page ${i + 1} · needs review`,
-          };
+            ocr.warnings?.[i] || (i === 0 ? ocr.warning : undefined),
+            sessionSaved,
+            batchSeen,
+          );
+          if (extraction?.invoice.invoice_number && item.status !== "duplicate") {
+            batchSeen.push({
+              id: item.id,
+              invoice_number: extraction.invoice.invoice_number,
+              vehicle_id: null,
+              repair_shop_id: matchShop(extraction, shops)?.id ?? null,
+              invoice_date: extraction.invoice.printed_date || extraction.invoice.work_completed_date,
+              invoice_total: extraction.invoice.total,
+              vin: normalizeVin(extraction.invoice.vin || extraction.vehicle.vin || ""),
+            });
+          }
+          return item;
         });
         return [...q.slice(0, idx), ...expanded, ...q.slice(idx + 1)];
       });
@@ -169,9 +262,70 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
     setQueue((q) => q.map((i) => (i.id === id ? { ...i, ...patch } : i)));
   }
 
+  function goNext(fromId: string) {
+    setQueue((q) => {
+      const next = q.find((item) => (item.status === "review" || item.status === "duplicate") && item.id !== fromId);
+      if (next) setActiveId(next.id);
+      return q;
+    });
+  }
+
+  function skipItem(id: string, reason = "Skipped — already in system") {
+    update(id, { status: "skipped", message: reason });
+    toast.message(reason);
+    goNext(id);
+  }
+
+  function skipAllDuplicates() {
+    let nextId: string | null = null;
+    let count = 0;
+    setQueue((q) => {
+      count = q.filter((item) => item.status === "duplicate").length;
+      const updated = q.map((item) =>
+        item.status === "duplicate"
+          ? {
+              ...item,
+              status: "skipped" as const,
+              message: `Skipped duplicate #${item.duplicateOf?.invoice_number ?? item.extraction?.invoice.invoice_number ?? ""}`,
+            }
+          : item,
+      );
+      nextId = updated.find((item) => item.status === "review")?.id ?? null;
+      return updated;
+    });
+    if (!count) {
+      toast.message("No duplicate invoices to skip");
+      return;
+    }
+    toast.success(`Skipped ${count} duplicate invoice${count === 1 ? "" : "s"}`);
+    if (nextId) setActiveId(nextId);
+  }
+
   async function confirmSave(form: HTMLFormElement) {
     if (!active?.extraction || !active.upload) return;
     const fd = new FormData(form);
+    const invoiceNumber = String(fd.get("invoice_number") || "") || null;
+    const liveDup =
+      activeDuplicate ||
+      findOcrDuplicate({
+        invoiceNumber,
+        vin: normalizeVin(String(fd.get("vin") || "")),
+        repairShopId: String(fd.get("repair_shop_id") || "") || null,
+        invoiceDate: String(fd.get("printed_date") || fd.get("work_completed_date") || "") || null,
+        invoiceTotal: String(fd.get("total") || "") || null,
+        existing: sessionSaved,
+      });
+
+    if (liveDup && !forceSaveDuplicate) {
+      update(active.id, {
+        status: "duplicate",
+        duplicateOf: liveDup,
+        message: `#${invoiceNumber ?? liveDup.invoice_number} already saved — skip`,
+      });
+      toast.error(`Invoice #${invoiceNumber ?? "—"} is already saved. Skip it, or choose Save anyway.`);
+      return;
+    }
+
     update(active.id, { status: "saving" });
     try {
       let vehicleId = String(fd.get("vehicle_id") || selectedVehicleId || "");
@@ -180,7 +334,6 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
         const match = vehicles.find((v) => v.vin === vin);
         if (match) vehicleId = match.id;
       }
-      // Auto-create when VIN is present (checkbox default ON for new VINs).
       if (!vehicleId && vin && (createNewVehicle || isValidVin(vin))) {
         if (!isValidVin(vin)) {
           throw new Error(vinValidationError(vin) || "Invalid VIN.");
@@ -209,7 +362,7 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
       const labor = collectLabor(fd);
 
       const res = await saveInvoice({
-        invoice_number: String(fd.get("invoice_number") || "") || null,
+        invoice_number: invoiceNumber,
         vehicle_id: vehicleId,
         repair_shop_id: String(fd.get("repair_shop_id") || "") || null,
         invoice_date: String(fd.get("printed_date") || fd.get("work_completed_date") || "") || null,
@@ -232,6 +385,7 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
         ocr_confidence: active.extraction.overall_confidence,
         ocr_payload: active.extraction.ocr_payload,
         manually_verified: true,
+        allow_duplicate: forceSaveDuplicate,
         parts: parts.map((p) => ({
           description: p.part_description,
           part_number: p.part_number,
@@ -259,20 +413,49 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
           ocr_confidence: active.extraction.overall_confidence,
         },
       });
-      update(active.id, { status: "saved", message: `Saved #${String(fd.get("invoice_number") || res.id.slice(0, 8))}` });
+
+      const savedMeta: InvoiceDupCandidate = {
+        id: res.id,
+        invoice_number: invoiceNumber,
+        vehicle_id: vehicleId,
+        repair_shop_id: String(fd.get("repair_shop_id") || "") || null,
+        invoice_date: String(fd.get("printed_date") || fd.get("work_completed_date") || "") || null,
+        invoice_total: String(fd.get("total") || "") || null,
+        vin: vin || null,
+      };
+      setSessionSaved((prev) => [...prev, savedMeta]);
+      // Mark any other queue items with the same invoice # as duplicates.
+      setQueue((q) =>
+        q.map((item) => {
+          if (item.id === active.id) {
+            return { ...item, status: "saved", message: `Saved #${invoiceNumber || res.id.slice(0, 8)}` };
+          }
+          if (item.status !== "review" && item.status !== "duplicate") return item;
+          const otherDup = detectDuplicate(item.extraction, shops, [...sessionSaved, savedMeta]);
+          if (!otherDup) return item;
+          return {
+            ...item,
+            status: "duplicate",
+            duplicateOf: otherDup,
+            message: `#${item.extraction?.invoice.invoice_number ?? otherDup.invoice_number} already saved — skip`,
+          };
+        }),
+      );
       toast.success("Invoice saved");
-      const next = queue.find((q) => q.status === "review" && q.id !== active.id);
+      setForceSaveDuplicate(false);
+      const next = queue.find((q) => (q.status === "review" || q.status === "duplicate") && q.id !== active.id);
       if (next) setActiveId(next.id);
       else router.push(`/invoices/${res.id}`);
       router.refresh();
     } catch (e) {
-      update(active.id, { status: "review", message: e instanceof Error ? e.message : "Save failed" });
+      update(active.id, { status: activeDuplicate ? "duplicate" : "review", message: e instanceof Error ? e.message : "Save failed" });
       toast.error(e instanceof Error ? e.message : "Save failed");
     }
   }
 
-  const done = queue.filter((q) => q.status === "saved").length;
-  const review = queue.filter((q) => q.status === "review").length;
+  const done = queue.filter((q) => q.status === "saved" || q.status === "skipped").length;
+  const review = queue.filter((q) => q.status === "review" || q.status === "duplicate").length;
+  const dupCount = queue.filter((q) => q.status === "duplicate").length;
 
   return (
     <div className="grid gap-6 lg:grid-cols-[280px_1fr]">
@@ -284,12 +467,20 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
           <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 text-center hover:bg-muted/50">
             <Upload className="mb-2 h-8 w-8 text-muted-foreground" />
             <div className="text-sm font-medium">Drop PDFs/images or click</div>
-            <div className="text-xs text-muted-foreground">Multiple files supported</div>
+            <div className="text-xs text-muted-foreground">Already-saved invoice #s are flagged to skip</div>
             <input type="file" className="hidden" multiple accept="application/pdf,image/*" onChange={(e) => onFiles(e.target.files)} />
           </label>
           {queue.length > 0 && (
-            <div className="mt-4 text-xs text-muted-foreground">
-              Processing {Math.min(done + review + 1, queue.length)} of {queue.length}
+            <div className="mt-4 space-y-2">
+              <div className="text-xs text-muted-foreground">
+                Done {done} · left {review} · of {queue.length}
+              </div>
+              {dupCount > 0 && (
+                <Button type="button" variant="outline" size="sm" className="w-full" onClick={skipAllDuplicates}>
+                  <SkipForward className="mr-1 h-3.5 w-3.5" />
+                  Skip all {dupCount} duplicates
+                </Button>
+              )}
             </div>
           )}
           <ul className="mt-3 space-y-2">
@@ -301,6 +492,8 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
                   className={cn(
                     "w-full rounded-lg border px-3 py-2 text-left text-xs",
                     activeId === item.id ? "border-primary bg-secondary" : "bg-card",
+                    item.status === "duplicate" && "border-amber-300",
+                    item.status === "skipped" && "opacity-70",
                   )}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -324,7 +517,16 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
           <Card>
             <CardContent className="p-8 text-sm text-muted-foreground">
               Upload one or more LALA invoices. The original document is stored first, then OCR extraction is shown for
-              verification. Nothing is saved until you confirm.
+              verification. If an invoice number is already in the system, you can skip it instead of saving again.
+            </CardContent>
+          </Card>
+        ) : active.status === "skipped" ? (
+          <Card>
+            <CardContent className="space-y-3 p-8">
+              <p className="text-sm">{active.message ?? "Skipped"}</p>
+              <Button type="button" variant="outline" onClick={() => goNext(active.id)}>
+                Next invoice
+              </Button>
             </CardContent>
           </Card>
         ) : (
@@ -336,6 +538,54 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
             }}
             className="space-y-4"
           >
+            {(active.status === "duplicate" || activeDuplicate) && (
+              <Alert variant="warning">
+                <AlertTriangle className="h-4 w-4" />
+                <AlertTitle>Already in the system</AlertTitle>
+                <AlertDescription className="space-y-3">
+                  <p>
+                    Invoice #{extraction.invoice.invoice_number ?? "—"} matches existing{" "}
+                    <Link
+                      href={`/invoices/${(activeDuplicate ?? active.duplicateOf)?.id}`}
+                      className="font-medium underline"
+                    >
+                      #{(activeDuplicate ?? active.duplicateOf)?.invoice_number ?? "invoice"}
+                    </Link>
+                    . Skip it to avoid a duplicate, or save anyway if this really is a new record.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      onClick={() =>
+                        skipItem(
+                          active.id,
+                          `Skipped duplicate #${extraction.invoice.invoice_number ?? (activeDuplicate ?? active.duplicateOf)?.invoice_number}`,
+                        )
+                      }
+                    >
+                      Skip this invoice
+                    </Button>
+                    {(activeDuplicate ?? active.duplicateOf)?.id && (
+                      <Button type="button" variant="outline" asChild>
+                        <Link href={`/invoices/${(activeDuplicate ?? active.duplicateOf)!.id}`}>Open existing</Link>
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => {
+                        setForceSaveDuplicate(true);
+                        update(active.id, { status: "review" });
+                        toast.message("Duplicate override on — Confirm & save will create another record.");
+                      }}
+                    >
+                      Save anyway
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
+            )}
+
             {active.warning && (
               <Alert variant="warning">
                 <AlertTriangle className="h-4 w-4" />
@@ -473,11 +723,26 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
               </CardContent>
             </Card>
 
-            <div className="flex gap-2">
-              <Button type="submit" disabled={active.status === "saving"}>
-                {active.status === "saving" ? "Saving…" : "Confirm & save"}
-              </Button>
+            <div className="flex flex-wrap gap-2">
+              {(active.status === "duplicate" || activeDuplicate) && !forceSaveDuplicate ? (
+                <Button
+                  type="button"
+                  onClick={() =>
+                    skipItem(
+                      active.id,
+                      `Skipped duplicate #${extraction.invoice.invoice_number ?? (activeDuplicate ?? active.duplicateOf)?.invoice_number}`,
+                    )
+                  }
+                >
+                  Skip this invoice
+                </Button>
+              ) : (
+                <Button type="submit" disabled={active.status === "saving"}>
+                  {active.status === "saving" ? "Saving…" : forceSaveDuplicate ? "Save duplicate anyway" : "Confirm & save"}
+                </Button>
+              )}
               <Badge variant="secondary">OCR confidence {extraction.overall_confidence}%</Badge>
+              {forceSaveDuplicate && <Badge variant="destructive">Duplicate override</Badge>}
             </div>
           </form>
         )}
@@ -487,8 +752,10 @@ export function UploadWorkflow({ vehicles, shops }: { vehicles: Vehicle[]; shops
 }
 
 function StatusIcon({ status }: { status: ItemStatus }) {
-  if (status === "saved") return <CheckCircle2 className="h-4 w-4 text-emerald-600" />;
-  if (status === "error" || status === "review") return <AlertTriangle className="h-4 w-4 text-amber-600" />;
+  if (status === "saved" || status === "skipped") return <CheckCircle2 className="h-4 w-4 text-emerald-600" />;
+  if (status === "duplicate" || status === "error" || status === "review") {
+    return <AlertTriangle className="h-4 w-4 text-amber-600" />;
+  }
   if (status === "queued") return <span className="text-muted-foreground">Queued</span>;
   return <Loader2 className="h-4 w-4 animate-spin text-primary" />;
 }
