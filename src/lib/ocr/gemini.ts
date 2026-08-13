@@ -2,6 +2,7 @@ import { emptyExtraction, normalizeExtraction } from "@/lib/ocr/parse";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
 import { OCR_SYSTEM_PROMPT } from "@/lib/ocr/prompt";
 import { pdfPageCount, splitPdfToPageBuffers } from "@/lib/ocr/split-pdf";
+import { geminiPaceDelayMs, recordGeminiRequest } from "@/lib/ocr/gemini-usage";
 import type { OcrExtractionResult } from "@/types";
 
 type GeminiExtractResult = { extractions: OcrExtractionResult[]; warning?: string };
@@ -66,6 +67,14 @@ async function geminiGenerate(
         generationConfig: { temperature: 0.1, responseMimeType: "application/json" },
       }),
     });
+
+    // Count every attempt against app usage (retries included).
+    const rateLimited = res.status === 429;
+    try {
+      await recordGeminiRequest({ rateLimited });
+    } catch {
+      /* usage tracking should never block OCR */
+    }
 
     if (res.ok) {
       const json = (await res.json()) as {
@@ -222,76 +231,124 @@ async function extractPageFromFile(
 export async function geminiExtractPdfByPage(
   apiKey: string,
   bytes: Buffer,
-): Promise<{ extractions: OcrExtractionResult[]; warning?: string; warnings: string[] }> {
+  opts: {
+    pageFrom?: number;
+    pageTo?: number;
+    /** Reuse a previously uploaded Gemini file across OCR chunks. */
+    geminiFileUri?: string;
+    geminiFileName?: string;
+    deleteFileWhenDone?: boolean;
+  } = {},
+): Promise<{
+  extractions: OcrExtractionResult[];
+  warning?: string;
+  warnings: string[];
+  page_count: number;
+  processed_from: number;
+  processed_to: number;
+  next_page: number | null;
+  gemini_file_uri?: string;
+  gemini_file_name?: string;
+}> {
   const totalPages = await pdfPageCount(bytes);
+  const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 12)));
+  const pageFrom = Math.max(1, opts.pageFrom ?? 1);
+  const pageTo = Math.min(totalPages, opts.pageTo ?? pageFrom + chunkSize - 1);
+
   if (totalPages <= 1) {
     const one = await geminiExtractInline(apiKey, bytes, "application/pdf", { singlePage: true, pageHint: 1 });
     return {
       extractions: one.extractions,
       warning: one.warning,
       warnings: one.warning ? [one.warning] : [],
+      page_count: 1,
+      processed_from: 1,
+      processed_to: 1,
+      next_page: null,
     };
   }
 
-  const concurrency = Math.max(1, Math.min(2, Number(process.env.OCR_PAGE_CONCURRENCY || 2)));
+  const concurrency = Math.max(1, Math.min(1, Number(process.env.OCR_PAGE_CONCURRENCY || 1)));
+  const paceMs = geminiPaceDelayMs();
+  const pageNumbers = Array.from({ length: pageTo - pageFrom + 1 }, (_, i) => pageFrom + i);
+
+  let fileUri = opts.geminiFileUri;
+  let fileName = opts.geminiFileName;
+  let uploadedHere = false;
 
   try {
-    const file = await uploadGeminiFile(apiKey, bytes, "application/pdf", `invoice-${Date.now()}.pdf`);
-    try {
-      const pageNumbers = Array.from({ length: totalPages }, (_, i) => i + 1);
-      const results = await mapPool(pageNumbers, concurrency, async (page) => {
-        // Gentle pacing to reduce 429s on large batches.
-        await sleep(150);
-        const r = await extractPageFromFile(apiKey, file.uri, "application/pdf", page, totalPages);
-        // Retry once more if empty and no hard warning about parse — often transient.
-        if (isEmptyExtraction(r.extractions[0]) && !(r.warning || "").includes("unparseable")) {
-          await sleep(500);
-          const again = await extractPageFromFile(apiKey, file.uri, "application/pdf", page, totalPages);
-          if (!isEmptyExtraction(again.extractions[0])) return { page, ...again };
-        }
-        return { page, ...r };
-      });
-
-      const extractions = results.map((r) => r.extractions[0] ?? emptyExtraction());
-      const warnings = results
-        .map((r) =>
-          r.warning
-            ? `Page ${r.page}: ${r.warning}`
-            : isEmptyExtraction(r.extractions[0])
-              ? `Page ${r.page}: little/no invoice data extracted`
-              : null,
-        )
-        .filter((w): w is string => Boolean(w));
-      const emptyCount = extractions.filter((e) => isEmptyExtraction(e)).length;
-      return {
-        extractions,
-        warnings,
-        warning:
-          warnings[0] ||
-          (emptyCount
-            ? `Processed ${totalPages} pages via Gemini Files API; ${emptyCount} still need review.`
-            : `Processed ${totalPages} pages via Gemini Files API.`),
-      };
-    } finally {
-      await deleteGeminiFile(apiKey, file.name);
+    if (!fileUri || !fileName) {
+      const file = await uploadGeminiFile(apiKey, bytes, "application/pdf", `invoice-${Date.now()}.pdf`);
+      fileUri = file.uri;
+      fileName = file.name;
+      uploadedHere = true;
     }
+
+    const results = await mapPool(pageNumbers, concurrency, async (page) => {
+      await sleep(paceMs);
+      const r = await extractPageFromFile(apiKey, fileUri!, "application/pdf", page, totalPages);
+      if (isEmptyExtraction(r.extractions[0]) && !(r.warning || "").includes("unparseable")) {
+        await sleep(Math.max(paceMs, 1500));
+        const again = await extractPageFromFile(apiKey, fileUri!, "application/pdf", page, totalPages);
+        if (!isEmptyExtraction(again.extractions[0])) return { page, ...again };
+      }
+      return { page, ...r };
+    });
+
+    const extractions = results.map((r) => r.extractions[0] ?? emptyExtraction());
+    const warnings = results
+      .map((r) =>
+        r.warning
+          ? `Page ${r.page}: ${r.warning}`
+          : isEmptyExtraction(r.extractions[0])
+            ? `Page ${r.page}: little/no invoice data extracted`
+            : null,
+      )
+      .filter((w): w is string => Boolean(w));
+    const emptyCount = extractions.filter((e) => isEmptyExtraction(e)).length;
+    const nextPage = pageTo < totalPages ? pageTo + 1 : null;
+    const shouldDelete = opts.deleteFileWhenDone ?? nextPage == null;
+
+    if (shouldDelete && fileName) {
+      await deleteGeminiFile(apiKey, fileName);
+    }
+
+    return {
+      extractions,
+      warnings,
+      warning:
+        warnings[0] ||
+        (emptyCount
+          ? `Processed pages ${pageFrom}–${pageTo} of ${totalPages}; ${emptyCount} still need review.`
+          : `Processed pages ${pageFrom}–${pageTo} of ${totalPages}.`),
+      page_count: totalPages,
+      processed_from: pageFrom,
+      processed_to: pageTo,
+      next_page: nextPage,
+      gemini_file_uri: shouldDelete ? undefined : fileUri,
+      gemini_file_name: shouldDelete ? undefined : fileName,
+    };
   } catch (fileApiErr) {
-    // Fallback: split PDF and send pages inline (slower / more rate-limit prone).
+    if (uploadedHere && fileName) await deleteGeminiFile(apiKey, fileName);
+
+    // Fallback: split only the requested page range inline.
     const pageBuffers = await splitPdfToPageBuffers(bytes);
-    const results = await mapPool(pageBuffers, 1, async (pageBytes, i) => {
-      await sleep(250);
+    const slice = pageBuffers.slice(pageFrom - 1, pageTo);
+    const results = await mapPool(slice, 1, async (pageBytes, i) => {
+      const page = pageFrom + i;
+      await sleep(paceMs);
       let r = await geminiExtractInline(apiKey, pageBytes, "application/pdf", {
         singlePage: true,
-        pageHint: i + 1,
+        pageHint: page,
       });
       if (isEmptyExtraction(r.extractions[0])) {
-        await sleep(600);
+        await sleep(Math.max(paceMs, 1500));
         r = await geminiExtractInline(apiKey, pageBytes, "application/pdf", {
           singlePage: true,
-          pageHint: i + 1,
+          pageHint: page,
         });
       }
-      return { page: i + 1, ...r };
+      return { page, ...r };
     });
 
     const extractions = results.map((r) => r.extractions[0] ?? emptyExtraction());
@@ -305,10 +362,15 @@ export async function geminiExtractPdfByPage(
       )
       .filter((w): w is string => Boolean(w));
     const reason = fileApiErr instanceof Error ? fileApiErr.message : "Files API unavailable";
+    const nextPage = pageTo < totalPages ? pageTo + 1 : null;
     return {
       extractions,
       warnings,
-      warning: `Files API unavailable (${reason}). Fell back to per-page inline OCR. ${warnings[0] || ""}`.trim(),
+      warning: `Files API unavailable (${reason}). Fell back to per-page inline OCR for pages ${pageFrom}–${pageTo}. ${warnings[0] || ""}`.trim(),
+      page_count: totalPages,
+      processed_from: pageFrom,
+      processed_to: pageTo,
+      next_page: nextPage,
     };
   }
 }

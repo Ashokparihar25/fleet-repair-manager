@@ -1,14 +1,16 @@
-import { readFile } from "fs/promises";
-import path from "path";
-import { NextResponse } from "next/server";
+import { assertGeminiBudget } from "@/lib/ocr/gemini-usage";
 import { emptyExtraction } from "@/lib/ocr/parse";
 import { parseLalaInvoice } from "@/lib/ocr/lala-parser";
 import { geminiExtractInline, geminiExtractPdfByPage } from "@/lib/ocr/gemini";
 import { canRunLocalOcr, rasterizePdf, runLocalOcr } from "@/lib/ocr/local";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
+import { pdfPageCount } from "@/lib/ocr/split-pdf";
 import { isUsingSupabase } from "@/lib/supabase/config";
 import { requireAdminSupabase } from "@/lib/supabase/admin";
 import type { OcrExtractionResult } from "@/types";
+import { readFile } from "fs/promises";
+import path from "path";
+import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -21,6 +23,11 @@ type OcrResponse = {
   warnings?: string[];
   needs_review: boolean;
   page_count: number;
+  processed_from?: number;
+  processed_to?: number;
+  next_page?: number | null;
+  gemini_file_uri?: string;
+  gemini_file_name?: string;
 };
 
 function payload(
@@ -36,7 +43,12 @@ function payload(
     warning: extra.warning,
     warnings: extra.warnings,
     needs_review: extra.needs_review ?? needs,
-    page_count: list.length,
+    page_count: extra.page_count ?? list.length,
+    processed_from: extra.processed_from,
+    processed_to: extra.processed_to,
+    next_page: extra.next_page ?? null,
+    gemini_file_uri: extra.gemini_file_uri,
+    gemini_file_name: extra.gemini_file_name,
   };
 }
 
@@ -57,15 +69,40 @@ async function runOcrOnBytes(input: {
   bytes: Buffer;
   fileName: string;
   mime: string;
+  pageFrom?: number;
+  pageTo?: number;
+  geminiFileUri?: string;
+  geminiFileName?: string;
 }): Promise<NextResponse> {
-  const { bytes, fileName, mime } = input;
+  const { bytes, fileName, mime, pageFrom, pageTo, geminiFileUri, geminiFileName } = input;
   const isPdf = mime.includes("pdf") || fileName.toLowerCase().endsWith(".pdf");
   const resolvedMime = isPdf ? "application/pdf" : mime || "image/png";
   const apiKey = process.env.GEMINI_API_KEY?.trim();
 
   try {
     if (apiKey) {
-      if (isPdf && canRunLocalOcr()) {
+      const pages = isPdf ? await pdfPageCount(bytes).catch(() => 1) : 1;
+      const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 12)));
+      const from = Math.max(1, pageFrom ?? 1);
+      const to = Math.min(pages, pageTo ?? from + chunkSize - 1);
+      const needed = isPdf ? to - from + 1 : 1;
+      try {
+        await assertGeminiBudget(needed);
+      } catch (budgetErr) {
+        return NextResponse.json(
+          payload([emptyExtraction()], {
+            engine: "none",
+            warning: budgetErr instanceof Error ? budgetErr.message : "Gemini daily limit reached.",
+            needs_review: true,
+            page_count: pages,
+            processed_from: from,
+            processed_to: from - 1,
+            next_page: from,
+          }),
+        );
+      }
+
+      if (isPdf && canRunLocalOcr() && !pageFrom) {
         try {
           const pageBuffers = await rasterizePdf(bytes);
           const results = [];
@@ -80,6 +117,10 @@ async function runOcrOnBytes(input: {
               warning: warnings[0],
               warnings,
               needs_review: extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || warnings.length > 0,
+              page_count: extractions.length,
+              processed_from: 1,
+              processed_to: extractions.length,
+              next_page: null,
             }),
           );
         } catch {
@@ -88,13 +129,24 @@ async function runOcrOnBytes(input: {
       }
 
       if (isPdf) {
-        const { extractions, warning, warnings } = await geminiExtractPdfByPage(apiKey, bytes);
+        const result = await geminiExtractPdfByPage(apiKey, bytes, {
+          pageFrom: from,
+          pageTo: to,
+          geminiFileUri,
+          geminiFileName,
+        });
         return NextResponse.json(
-          payload(extractions, {
+          payload(result.extractions, {
             engine: "gemini",
-            warning,
-            warnings,
-            needs_review: extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || Boolean(warning),
+            warning: result.warning,
+            warnings: result.warnings,
+            needs_review: result.extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || Boolean(result.warning),
+            page_count: result.page_count,
+            processed_from: result.processed_from,
+            processed_to: result.processed_to,
+            next_page: result.next_page,
+            gemini_file_uri: result.gemini_file_uri,
+            gemini_file_name: result.gemini_file_name,
           }),
         );
       }
@@ -105,6 +157,10 @@ async function runOcrOnBytes(input: {
           engine: "gemini",
           warning,
           needs_review: extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || Boolean(warning),
+          page_count: 1,
+          processed_from: 1,
+          processed_to: 1,
+          next_page: null,
         }),
       );
     }
@@ -167,6 +223,10 @@ export async function POST(req: Request) {
       file_path?: string;
       file_name?: string;
       file_type?: string;
+      page_from?: number;
+      page_to?: number;
+      gemini_file_uri?: string;
+      gemini_file_name?: string;
     } | null;
     const filePath = body?.file_path?.trim();
     if (!filePath) {
@@ -178,7 +238,15 @@ export async function POST(req: Request) {
       const mime =
         body?.file_type ||
         (fileName.toLowerCase().endsWith(".pdf") ? "application/pdf" : "application/octet-stream");
-      return runOcrOnBytes({ bytes, fileName, mime });
+      return runOcrOnBytes({
+        bytes,
+        fileName,
+        mime,
+        pageFrom: body?.page_from,
+        pageTo: body?.page_to,
+        geminiFileUri: body?.gemini_file_uri,
+        geminiFileName: body?.gemini_file_name,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : "OCR failed";
       return NextResponse.json(

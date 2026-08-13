@@ -189,41 +189,85 @@ export function UploadWorkflow({
   async function processOne(id: string, file: File) {
     update(id, { status: "uploading" });
     try {
-      // Direct-to-Storage on hosted Supabase so large PDFs bypass Vercel’s ~4.5MB body limit.
       const up = await uploadInvoiceFile(file);
-      update(id, { status: "extracting", upload: up });
+      update(id, { status: "extracting", upload: up, message: "Extracting pages…" });
 
-      const ocrRes = await fetch("/api/ocr", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          file_path: up.file_path,
-          file_name: up.file_name,
-          file_type: up.file_type,
-        }),
-      });
-      const ocr = await parseApiJson<{
+      const allExtractions: OcrExtractionResult[] = [];
+      const allWarnings: string[] = [];
+      let nextPage: number | null = 1;
+      let geminiFileUri: string | undefined;
+      let geminiFileName: string | undefined;
+      let totalPages: number | null = null;
+      let firstWarning: string | undefined;
+      let guard = 0;
+
+      type OcrChunkResponse = {
         extractions?: OcrExtractionResult[];
         extraction?: OcrExtractionResult;
         warning?: string;
         warnings?: string[];
         needs_review?: boolean;
         error?: string;
-      }>(ocrRes);
-      if (!ocrRes.ok && ocr.error) throw new Error(ocr.error);
+        page_count?: number;
+        processed_from?: number;
+        processed_to?: number;
+        next_page?: number | null;
+        gemini_file_uri?: string;
+        gemini_file_name?: string;
+      };
 
-      const extractions: OcrExtractionResult[] =
-        Array.isArray(ocr.extractions) && ocr.extractions.length
-          ? ocr.extractions
-          : ocr.extraction
-            ? [ocr.extraction]
-            : [];
+      while (nextPage != null && guard < 100) {
+        guard += 1;
+        const chunkFrom = nextPage;
+        update(id, {
+          message: totalPages
+            ? `OCR pages ${nextPage}–… of ${totalPages} (Gemini paced)`
+            : `OCR starting at page ${nextPage}…`,
+        });
+        const ocrRes: Response = await fetch("/api/ocr", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file_path: up.file_path,
+            file_name: up.file_name,
+            file_type: up.file_type,
+            page_from: nextPage,
+            gemini_file_uri: geminiFileUri,
+            gemini_file_name: geminiFileName,
+          }),
+        });
+        const ocr: OcrChunkResponse = await parseApiJson<OcrChunkResponse>(ocrRes);
+        if (!ocrRes.ok && ocr.error) throw new Error(ocr.error);
+        if (ocr.warning?.includes("daily limit")) throw new Error(ocr.warning);
+
+        const chunk: OcrExtractionResult[] =
+          Array.isArray(ocr.extractions) && ocr.extractions.length
+            ? ocr.extractions
+            : ocr.extraction
+              ? [ocr.extraction]
+              : [];
+        allExtractions.push(...chunk);
+        if (ocr.warnings?.length) allWarnings.push(...ocr.warnings);
+        if (!firstWarning && ocr.warning) firstWarning = ocr.warning;
+        totalPages = ocr.page_count ?? totalPages;
+        geminiFileUri = ocr.gemini_file_uri || geminiFileUri;
+        geminiFileName = ocr.gemini_file_name || geminiFileName;
+        const following = ocr.next_page ?? null;
+        if (following != null && (ocr.processed_to == null || ocr.processed_to < chunkFrom)) {
+          throw new Error("OCR made no progress on this chunk — stopped to avoid a loop.");
+        }
+        nextPage = following;
+      }
+
+      const extractions = allExtractions;
+      const ocrWarning = firstWarning;
+      const ocrWarnings = allWarnings;
 
       if (extractions.length <= 1) {
         const item = buildReviewItem(
           { id, file, upload: up },
           extractions[0],
-          ocr.warning,
+          ocrWarning,
           sessionSaved,
           [],
         );
@@ -246,7 +290,7 @@ export function UploadWorkflow({
               page: i + 1,
             },
             extraction,
-            ocr.warnings?.[i] || (i === 0 ? ocr.warning : undefined),
+            ocrWarnings?.[i] || (i === 0 ? ocrWarning : undefined),
             sessionSaved,
             batchSeen,
           );

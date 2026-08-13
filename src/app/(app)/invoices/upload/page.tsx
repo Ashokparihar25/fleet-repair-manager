@@ -1,6 +1,7 @@
 import { getStore } from "@/lib/data/queries";
 import { PageHeader } from "@/components/layout/page-header";
 import { UploadWorkflow } from "@/components/invoices/upload-workflow";
+import { GeminiUsageBanner } from "@/components/invoices/gemini-usage-banner";
 
 export default async function UploadInvoicePage() {
   const store = await getStore();
@@ -19,8 +20,11 @@ export default async function UploadInvoicePage() {
       <PageHeader
         crumbs={[{ href: "/invoices", label: "Invoices" }, { label: "Upload" }]}
         title="Upload invoices"
-        description="Large PDFs upload straight to Storage (bypasses host size limits). OCR runs page-by-page; already-saved invoice numbers can be skipped."
+        description="Large PDFs upload straight to Storage. OCR is paced to Gemini rate limits; already-saved invoice numbers can be skipped."
       />
+      <div className="mb-4">
+        <GeminiUsageBanner />
+      </div>
       <UploadWorkflow vehicles={store.vehicles} shops={store.repair_shops} existingInvoices={existingInvoices} />
     </div>
   );
