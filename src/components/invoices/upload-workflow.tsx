@@ -811,7 +811,7 @@ export function UploadWorkflow({
               </CardContent>
             </Card>
 
-            <div className="flex flex-wrap gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {(active.status === "duplicate" || activeDuplicate) && !forceSaveDuplicate ? (
                 <Button
                   type="button"
@@ -825,9 +825,27 @@ export function UploadWorkflow({
                   Skip this invoice
                 </Button>
               ) : (
-                <Button type="submit" disabled={active.status === "saving"}>
-                  {active.status === "saving" ? "Saving…" : forceSaveDuplicate ? "Save duplicate anyway" : "Confirm & save"}
-                </Button>
+                <>
+                  <Button type="submit" disabled={active.status === "saving"}>
+                    {active.status === "saving" ? "Saving…" : forceSaveDuplicate ? "Save duplicate anyway" : "Confirm & save"}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={active.status === "saving"}
+                    onClick={() =>
+                      skipItem(
+                        active.id,
+                        `Skipped${active.page ? ` page ${active.page}` : ""}${
+                          extraction.invoice.invoice_number ? ` · #${extraction.invoice.invoice_number}` : ""
+                        }`,
+                      )
+                    }
+                  >
+                    <SkipForward className="mr-1 h-3.5 w-3.5" />
+                    Skip this page
+                  </Button>
+                </>
               )}
               <Badge variant="secondary">OCR confidence {extraction.overall_confidence}%</Badge>
               {forceSaveDuplicate && <Badge variant="destructive">Duplicate override</Badge>}
