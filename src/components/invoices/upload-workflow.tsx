@@ -8,7 +8,7 @@ import { toast } from "sonner";
 import { createVehicleFromVin, saveInvoice } from "@/app/actions/fleet";
 import { findOcrDuplicate, type InvoiceDupCandidate } from "@/lib/duplicates";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
-import { parseApiJson, uploadInvoiceFile } from "@/lib/upload-client";
+import { fetchJsonWithRetry, humanizeFetchError, uploadInvoiceFile } from "@/lib/upload-client";
 import { normalizeVin, isValidVin, vinValidationError } from "@/lib/vin";
 import type { OcrExtractionResult, RepairShop, Vehicle } from "@/types";
 import { Button } from "@/components/ui/button";
@@ -190,14 +190,36 @@ export function UploadWorkflow({
     update(id, { status: "uploading" });
     try {
       const up = await uploadInvoiceFile(file);
-      update(id, { status: "extracting", upload: up, message: "Extracting pages…" });
+      update(id, { status: "extracting", upload: up, message: "Preparing Gemini OCR…" });
+
+      const { res: prepRes, data: prep } = await fetchJsonWithRetry<{
+        page_count?: number;
+        gemini_file_uri?: string;
+        gemini_file_name?: string;
+        error?: string;
+      }>(
+        "/api/ocr/prepare",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file_path: up.file_path,
+            file_name: up.file_name,
+            file_type: up.file_type,
+          }),
+        },
+        { label: "OCR prepare", retries: 2 },
+      );
+      if (!prepRes.ok || !prep.gemini_file_uri) {
+        throw new Error(prep.error || "Could not prepare Gemini OCR file");
+      }
 
       const allExtractions: OcrExtractionResult[] = [];
       const allWarnings: string[] = [];
       let nextPage: number | null = 1;
-      let geminiFileUri: string | undefined;
-      let geminiFileName: string | undefined;
-      let totalPages: number | null = null;
+      let geminiFileUri: string | undefined = prep.gemini_file_uri;
+      let geminiFileName: string | undefined = prep.gemini_file_name;
+      let totalPages: number | null = prep.page_count ?? null;
       let firstWarning: string | undefined;
       let guard = 0;
 
@@ -216,27 +238,35 @@ export function UploadWorkflow({
         gemini_file_name?: string;
       };
 
-      while (nextPage != null && guard < 100) {
+      while (nextPage != null && guard < 200) {
         guard += 1;
         const chunkFrom = nextPage;
         update(id, {
           message: totalPages
-            ? `OCR pages ${nextPage}–… of ${totalPages} (Gemini paced)`
+            ? `OCR pages ${nextPage}–… of ${totalPages} (small batches + retries)`
             : `OCR starting at page ${nextPage}…`,
         });
-        const ocrRes: Response = await fetch("/api/ocr", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            file_path: up.file_path,
-            file_name: up.file_name,
-            file_type: up.file_type,
-            page_from: nextPage,
-            gemini_file_uri: geminiFileUri,
-            gemini_file_name: geminiFileName,
-          }),
-        });
-        const ocr: OcrChunkResponse = await parseApiJson<OcrChunkResponse>(ocrRes);
+
+        const ocrFetch = await fetchJsonWithRetry<OcrChunkResponse>(
+          "/api/ocr",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              file_path: up.file_path,
+              file_name: up.file_name,
+              file_type: up.file_type,
+              page_from: nextPage,
+              page_count: totalPages,
+              gemini_file_uri: geminiFileUri,
+              gemini_file_name: geminiFileName,
+            }),
+          },
+          { label: `OCR pages from ${nextPage}`, retries: 3 },
+        );
+        const ocrRes: Response = ocrFetch.res;
+        const ocr: OcrChunkResponse = ocrFetch.data;
+
         if (!ocrRes.ok && ocr.error) throw new Error(ocr.error);
         if (ocr.warning?.includes("daily limit")) throw new Error(ocr.warning);
 
@@ -252,7 +282,7 @@ export function UploadWorkflow({
         totalPages = ocr.page_count ?? totalPages;
         geminiFileUri = ocr.gemini_file_uri || geminiFileUri;
         geminiFileName = ocr.gemini_file_name || geminiFileName;
-        const following = ocr.next_page ?? null;
+        const following: number | null = ocr.next_page ?? null;
         if (following != null && (ocr.processed_to == null || ocr.processed_to < chunkFrom)) {
           throw new Error("OCR made no progress on this chunk — stopped to avoid a loop.");
         }
@@ -311,7 +341,7 @@ export function UploadWorkflow({
       });
       setActiveId(`${id}-p1`);
     } catch (e) {
-      update(id, { status: "error", message: e instanceof Error ? e.message : "Failed" });
+      update(id, { status: "error", message: humanizeFetchError(e, "Failed") });
     }
   }
 

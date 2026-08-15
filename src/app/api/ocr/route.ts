@@ -1,7 +1,7 @@
 import { assertGeminiBudget } from "@/lib/ocr/gemini-usage";
 import { emptyExtraction } from "@/lib/ocr/parse";
 import { parseLalaInvoice } from "@/lib/ocr/lala-parser";
-import { geminiExtractInline, geminiExtractPdfByPage } from "@/lib/ocr/gemini";
+import { geminiExtractInline, geminiExtractPageRangeFromFile, geminiExtractPdfByPage } from "@/lib/ocr/gemini";
 import { canRunLocalOcr, rasterizePdf, runLocalOcr } from "@/lib/ocr/local";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
 import { pdfPageCount } from "@/lib/ocr/split-pdf";
@@ -82,7 +82,7 @@ async function runOcrOnBytes(input: {
   try {
     if (apiKey) {
       const pages = isPdf ? await pdfPageCount(bytes).catch(() => 1) : 1;
-      const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 12)));
+      const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 3)));
       const from = Math.max(1, pageFrom ?? 1);
       const to = Math.min(pages, pageTo ?? from + chunkSize - 1);
       const needed = isPdf ? to - from + 1 : 1;
@@ -225,6 +225,7 @@ export async function POST(req: Request) {
       file_type?: string;
       page_from?: number;
       page_to?: number;
+      page_count?: number;
       gemini_file_uri?: string;
       gemini_file_name?: string;
     } | null;
@@ -232,6 +233,57 @@ export async function POST(req: Request) {
     if (!filePath) {
       return NextResponse.json({ error: "file_path is required" }, { status: 400 });
     }
+
+    const apiKey = process.env.GEMINI_API_KEY?.trim();
+    const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 3)));
+
+    // Fast path: Gemini file already prepared — no PDF re-download (avoids host timeouts).
+    if (apiKey && body?.gemini_file_uri && body.page_count && body.page_count > 0) {
+      const from = Math.max(1, body.page_from ?? 1);
+      const to = Math.min(body.page_count, body.page_to ?? from + chunkSize - 1);
+      try {
+        await assertGeminiBudget(to - from + 1);
+        const result = await geminiExtractPageRangeFromFile(apiKey, {
+          fileUri: body.gemini_file_uri,
+          fileName: body.gemini_file_name,
+          pageFrom: from,
+          pageTo: to,
+          pageCount: body.page_count,
+        });
+        return NextResponse.json(
+          payload(result.extractions, {
+            engine: "gemini",
+            warning: result.warning,
+            warnings: result.warnings,
+            needs_review:
+              result.extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) ||
+              Boolean(result.warning),
+            page_count: result.page_count,
+            processed_from: result.processed_from,
+            processed_to: result.processed_to,
+            next_page: result.next_page,
+            gemini_file_uri: result.gemini_file_uri,
+            gemini_file_name: result.gemini_file_name,
+          }),
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "OCR failed";
+        return NextResponse.json(
+          payload([emptyExtraction()], {
+            engine: "none",
+            warning: `OCR failed (${message}).`,
+            needs_review: true,
+            page_count: body.page_count,
+            processed_from: from,
+            processed_to: from - 1,
+            next_page: from,
+            gemini_file_uri: body.gemini_file_uri,
+            gemini_file_name: body.gemini_file_name,
+          }),
+        );
+      }
+    }
+
     try {
       const bytes = await loadBytesFromStorage(filePath);
       const fileName = body?.file_name || path.basename(filePath);

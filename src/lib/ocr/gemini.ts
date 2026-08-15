@@ -197,6 +197,11 @@ async function uploadGeminiFile(
   throw new Error("Timed out waiting for Gemini to process the uploaded PDF.");
 }
 
+/** Public helper used by /api/ocr/prepare so the browser can stage the Gemini file before page chunks. */
+export async function prepareGeminiPdfFile(apiKey: string, bytes: Buffer, fileName: string) {
+  return uploadGeminiFile(apiKey, bytes, "application/pdf", fileName || `invoice-${Date.now()}.pdf`);
+}
+
 async function deleteGeminiFile(apiKey: string, name: string) {
   try {
     await fetch(`https://generativelanguage.googleapis.com/v1beta/${name}?key=${apiKey}`, { method: "DELETE" });
@@ -227,6 +232,77 @@ async function extractPageFromFile(
   }
 }
 
+/** Extract a small page range from an already-uploaded Gemini file (no PDF re-download). */
+export async function geminiExtractPageRangeFromFile(
+  apiKey: string,
+  opts: {
+    fileUri: string;
+    fileName?: string;
+    pageFrom: number;
+    pageTo: number;
+    pageCount: number;
+    deleteFileWhenDone?: boolean;
+  },
+): Promise<{
+  extractions: OcrExtractionResult[];
+  warning?: string;
+  warnings: string[];
+  page_count: number;
+  processed_from: number;
+  processed_to: number;
+  next_page: number | null;
+  gemini_file_uri?: string;
+  gemini_file_name?: string;
+}> {
+  const totalPages = Math.max(1, opts.pageCount);
+  const pageFrom = Math.max(1, opts.pageFrom);
+  const pageTo = Math.min(totalPages, opts.pageTo);
+  const paceMs = geminiPaceDelayMs();
+  const pageNumbers = Array.from({ length: pageTo - pageFrom + 1 }, (_, i) => pageFrom + i);
+
+  const results = await mapPool(pageNumbers, 1, async (page) => {
+    await sleep(paceMs);
+    const r = await extractPageFromFile(apiKey, opts.fileUri, "application/pdf", page, totalPages);
+    if (isEmptyExtraction(r.extractions[0]) && !(r.warning || "").includes("unparseable")) {
+      await sleep(Math.max(paceMs, 1500));
+      const again = await extractPageFromFile(apiKey, opts.fileUri, "application/pdf", page, totalPages);
+      if (!isEmptyExtraction(again.extractions[0])) return { page, ...again };
+    }
+    return { page, ...r };
+  });
+
+  const extractions = results.map((r) => r.extractions[0] ?? emptyExtraction());
+  const warnings = results
+    .map((r) =>
+      r.warning
+        ? `Page ${r.page}: ${r.warning}`
+        : isEmptyExtraction(r.extractions[0])
+          ? `Page ${r.page}: little/no invoice data extracted`
+          : null,
+    )
+    .filter((w): w is string => Boolean(w));
+  const emptyCount = extractions.filter((e) => isEmptyExtraction(e)).length;
+  const nextPage = pageTo < totalPages ? pageTo + 1 : null;
+  const shouldDelete = opts.deleteFileWhenDone ?? nextPage == null;
+  if (shouldDelete && opts.fileName) await deleteGeminiFile(apiKey, opts.fileName);
+
+  return {
+    extractions,
+    warnings,
+    warning:
+      warnings[0] ||
+      (emptyCount
+        ? `Processed pages ${pageFrom}–${pageTo} of ${totalPages}; ${emptyCount} still need review.`
+        : `Processed pages ${pageFrom}–${pageTo} of ${totalPages}.`),
+    page_count: totalPages,
+    processed_from: pageFrom,
+    processed_to: pageTo,
+    next_page: nextPage,
+    gemini_file_uri: shouldDelete ? undefined : opts.fileUri,
+    gemini_file_name: shouldDelete ? undefined : opts.fileName,
+  };
+}
+
 /** Prefer one Files API upload + per-page prompts; fall back to split inline PDFs. */
 export async function geminiExtractPdfByPage(
   apiKey: string,
@@ -251,7 +327,7 @@ export async function geminiExtractPdfByPage(
   gemini_file_name?: string;
 }> {
   const totalPages = await pdfPageCount(bytes);
-  const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 12)));
+  const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 3)));
   const pageFrom = Math.max(1, opts.pageFrom ?? 1);
   const pageTo = Math.min(totalPages, opts.pageTo ?? pageFrom + chunkSize - 1);
 
