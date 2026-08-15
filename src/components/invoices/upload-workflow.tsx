@@ -194,8 +194,10 @@ export function UploadWorkflow({
 
       const { res: prepRes, data: prep } = await fetchJsonWithRetry<{
         page_count?: number;
-        gemini_file_uri?: string;
-        gemini_file_name?: string;
+        pages_per_request?: number;
+        requests_needed?: number;
+        requests_remaining?: number | null;
+        warning?: string;
         error?: string;
       }>(
         "/api/ocr/prepare",
@@ -210,17 +212,15 @@ export function UploadWorkflow({
         },
         { label: "OCR prepare", retries: 2 },
       );
-      if (!prepRes.ok || !prep.gemini_file_uri) {
-        throw new Error(prep.error || "Could not prepare Gemini OCR file");
+      if (!prepRes.ok) {
+        throw new Error(prep.error || "Could not read the uploaded PDF");
       }
 
       const allExtractions: OcrExtractionResult[] = [];
       const allWarnings: string[] = [];
       let nextPage: number | null = 1;
-      let geminiFileUri: string | undefined = prep.gemini_file_uri;
-      let geminiFileName: string | undefined = prep.gemini_file_name;
       let totalPages: number | null = prep.page_count ?? null;
-      let firstWarning: string | undefined;
+      let firstWarning: string | undefined = prep.warning;
       let guard = 0;
 
       type OcrChunkResponse = {
@@ -234,17 +234,16 @@ export function UploadWorkflow({
         processed_from?: number;
         processed_to?: number;
         next_page?: number | null;
-        gemini_file_uri?: string;
-        gemini_file_name?: string;
+        quota_exhausted?: boolean;
       };
 
-      while (nextPage != null && guard < 200) {
+      while (nextPage != null && guard < 60) {
         guard += 1;
         const chunkFrom = nextPage;
         update(id, {
           message: totalPages
-            ? `OCR pages ${nextPage}–… of ${totalPages} (small batches + retries)`
-            : `OCR starting at page ${nextPage}…`,
+            ? `Reading pages ${nextPage}–${Math.min(totalPages, nextPage + (prep.pages_per_request ?? 6) - 1)} of ${totalPages}…`
+            : `Reading from page ${nextPage}…`,
         });
 
         const ocrFetch = await fetchJsonWithRetry<OcrChunkResponse>(
@@ -257,9 +256,6 @@ export function UploadWorkflow({
               file_name: up.file_name,
               file_type: up.file_type,
               page_from: nextPage,
-              page_count: totalPages,
-              gemini_file_uri: geminiFileUri,
-              gemini_file_name: geminiFileName,
             }),
           },
           { label: `OCR pages from ${nextPage}`, retries: 3 },
@@ -268,7 +264,6 @@ export function UploadWorkflow({
         const ocr: OcrChunkResponse = ocrFetch.data;
 
         if (!ocrRes.ok && ocr.error) throw new Error(ocr.error);
-        if (ocr.warning?.includes("daily limit")) throw new Error(ocr.warning);
 
         const chunk: OcrExtractionResult[] =
           Array.isArray(ocr.extractions) && ocr.extractions.length
@@ -280,11 +275,17 @@ export function UploadWorkflow({
         if (ocr.warnings?.length) allWarnings.push(...ocr.warnings);
         if (!firstWarning && ocr.warning) firstWarning = ocr.warning;
         totalPages = ocr.page_count ?? totalPages;
-        geminiFileUri = ocr.gemini_file_uri || geminiFileUri;
-        geminiFileName = ocr.gemini_file_name || geminiFileName;
+
+        // Quota ran out mid-file: keep the pages already extracted instead of failing the upload.
+        if (ocr.quota_exhausted) {
+          if (!allExtractions.length) throw new Error(ocr.warning || "Gemini daily quota reached.");
+          firstWarning = ocr.warning || firstWarning;
+          break;
+        }
+
         const following: number | null = ocr.next_page ?? null;
         if (following != null && (ocr.processed_to == null || ocr.processed_to < chunkFrom)) {
-          throw new Error("OCR made no progress on this chunk — stopped to avoid a loop.");
+          throw new Error("OCR made no progress on this batch — stopped to avoid a loop.");
         }
         nextPage = following;
       }

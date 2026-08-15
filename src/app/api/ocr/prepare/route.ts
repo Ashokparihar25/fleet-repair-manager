@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSession } from "@/lib/auth";
-import { assertGeminiBudget } from "@/lib/ocr/gemini-usage";
-import { prepareGeminiPdfFile } from "@/lib/ocr/gemini";
+import { getGeminiUsage, geminiPagesPerRequest } from "@/lib/ocr/gemini-usage";
 import { pdfPageCount } from "@/lib/ocr/split-pdf";
 import { isUsingSupabase } from "@/lib/supabase/config";
 import { requireAdminSupabase } from "@/lib/supabase/admin";
@@ -9,7 +8,7 @@ import { readFile } from "fs/promises";
 import path from "path";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 120;
 
 async function loadBytesFromStorage(filePath: string): Promise<Buffer> {
   if (isUsingSupabase()) {
@@ -24,8 +23,8 @@ async function loadBytesFromStorage(filePath: string): Promise<Buffer> {
 }
 
 /**
- * Upload PDF to Gemini Files API once, then OCR pages in small chunks using the returned uri.
- * Keeps the first browser request from also doing 12 paced page extracts (which caused Failed to fetch timeouts).
+ * Count pages so the browser knows how many OCR batches to request.
+ * Costs no Gemini quota — extraction happens in /api/ocr.
  */
 export async function POST(req: Request) {
   const session = await getSession();
@@ -40,25 +39,32 @@ export async function POST(req: Request) {
   const filePath = body?.file_path?.trim();
   if (!filePath) return NextResponse.json({ error: "file_path is required" }, { status: 400 });
 
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) {
+  if (!process.env.GEMINI_API_KEY?.trim()) {
     return NextResponse.json({ error: "GEMINI_API_KEY is not configured." }, { status: 400 });
   }
 
+  const fileName = body?.file_name || path.basename(filePath);
+  const isPdf = (body?.file_type || "").includes("pdf") || fileName.toLowerCase().endsWith(".pdf");
+  const pagesPerRequest = geminiPagesPerRequest();
+
   try {
-    await assertGeminiBudget(1);
-    const bytes = await loadBytesFromStorage(filePath);
-    const fileName = body?.file_name || path.basename(filePath);
-    const pageCount = await pdfPageCount(bytes);
-    const prepared = await prepareGeminiPdfFile(apiKey, bytes, fileName);
+    const pageCount = isPdf ? await pdfPageCount(await loadBytesFromStorage(filePath)) : 1;
+    const usage = await getGeminiUsage();
+    const requestsNeeded = Math.ceil(pageCount / pagesPerRequest);
+    const quotaShort = usage.remaining != null && usage.remaining < requestsNeeded;
+
     return NextResponse.json({
       page_count: pageCount,
-      gemini_file_uri: prepared.uri,
-      gemini_file_name: prepared.name,
+      pages_per_request: pagesPerRequest,
+      requests_needed: requestsNeeded,
+      requests_remaining: usage.remaining,
+      warning: quotaShort
+        ? `This file needs ~${requestsNeeded} Gemini requests but only ${usage.remaining} remain today. Pages beyond the quota will need a re-run after midnight Pacific.`
+        : undefined,
     });
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Could not prepare Gemini OCR file" },
+      { error: err instanceof Error ? err.message : "Could not read the uploaded PDF" },
       { status: 500 },
     );
   }

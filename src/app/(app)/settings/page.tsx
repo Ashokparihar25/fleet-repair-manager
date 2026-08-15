@@ -87,20 +87,25 @@ export default async function SettingsPage() {
               extraction from scanned PDFs/images.
             </p>
             <p>
-              Free-tier <code>gemini-2.5-flash</code> is commonly limited to about <strong>10 requests/minute</strong> and{" "}
-              <strong>250 requests/day</strong> (confirm in{" "}
+              Free-tier Flash models allow about <strong>10 requests/minute</strong> and <strong>20 requests/day</strong>{" "}
+              per model (confirm in{" "}
               <a className="text-primary underline" href="https://aistudio.google.com/rate-limit" target="_blank" rel="noreferrer">
                 AI Studio → Rate limits
               </a>
-              ). Each PDF page uses ~1 API call, so a 46-page PDF needs ~46+ calls. Quotas reset at midnight Pacific.
+              ). OCR batches up to {process.env.OCR_PAGE_BATCH || "6"} invoice pages into one request and falls back to
+              the next model in the list when a quota runs out. Quotas reset at midnight Pacific.
             </p>
             <p>
               Set <code>OCR_GEMINI_RPD_LIMIT</code> / <code>OCR_GEMINI_RPM_LIMIT</code> to match your project. The upload
               page shows remaining attempts for today.
             </p>
             <Row label="GEMINI_API_KEY" value={process.env.GEMINI_API_KEY ? "Configured" : "Missing"} />
-            <Row label="Model" value={process.env.OCR_GEMINI_MODEL || "gemini-2.5-flash"} />
-            <Row label="Daily limit (app)" value={process.env.OCR_GEMINI_RPD_LIMIT || "250"} />
+            <Row
+              label="Models"
+              value={process.env.OCR_GEMINI_MODELS || "gemini-3.7-flash, gemini-3.5-flash, gemini-2.5-flash"}
+            />
+            <Row label="Pages per request" value={process.env.OCR_PAGE_BATCH || "6"} />
+            <Row label="Daily limit per model (app)" value={process.env.OCR_GEMINI_RPD_LIMIT || "20"} />
             <Row label="RPM pace (app)" value={process.env.OCR_GEMINI_RPM_LIMIT || "10"} />
           </CardContent>
         </Card>

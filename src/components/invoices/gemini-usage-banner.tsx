@@ -5,6 +5,14 @@ import { AlertTriangle, Gauge } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 
+type ModelUsage = {
+  model: string;
+  used: number;
+  remaining: number | null;
+  limit_rpd: number | null;
+  exhausted: boolean;
+};
+
 type Usage = {
   day: string;
   used: number;
@@ -12,6 +20,9 @@ type Usage = {
   limit_rpd: number | null;
   limit_rpm: number;
   model: string;
+  models: ModelUsage[];
+  pages_per_request: number;
+  pages_remaining: number | null;
   rate_limit_hits: number;
   configured: boolean;
   note: string;
@@ -34,7 +45,10 @@ export function GeminiUsageBanner({ estimatedPages }: { estimatedPages?: number 
         remaining: null,
         limit_rpd: null,
         limit_rpm: 10,
-        model: "gemini-2.5-flash",
+        model: "gemini-3.7-flash",
+        models: [],
+        pages_per_request: 6,
+        pages_remaining: null,
         rate_limit_hits: 0,
         configured: false,
         note: "",
@@ -80,54 +94,55 @@ export function GeminiUsageBanner({ estimatedPages }: { estimatedPages?: number 
   }
 
   const remaining = usage.remaining;
-  const low = remaining != null && remaining <= 30;
+  const pagesLeft = usage.pages_remaining;
+  const low = pagesLeft != null && pagesLeft <= 20;
   const empty = remaining != null && remaining <= 0;
   const pages = estimatedPages && estimatedPages > 0 ? estimatedPages : null;
-  const mayExceed = pages != null && remaining != null && pages > remaining;
+  const mayExceed = pages != null && pagesLeft != null && pages > pagesLeft;
 
   return (
     <Alert variant={empty ? "destructive" : low ? "warning" : "default"}>
       <Gauge className="h-4 w-4" />
       <AlertTitle className="flex flex-wrap items-center gap-2">
         Gemini OCR quota
-        <Badge variant="secondary">{usage.model}</Badge>
-        {usage.rate_limit_hits > 0 && <Badge variant="warning">{usage.rate_limit_hits} rate-limit hits today</Badge>}
+        {usage.models.map((m) => (
+          <Badge key={m.model} variant={m.exhausted ? "warning" : "secondary"}>
+            {m.model}: {m.remaining ?? "∞"} left
+          </Badge>
+        ))}
       </AlertTitle>
       <AlertDescription className="space-y-2">
         <p>
-          {usage.limit_rpd == null ? (
+          {remaining == null ? (
             <>
               Used <strong>{usage.used}</strong> requests today ({usage.day} Pacific). No daily cap configured.
             </>
           ) : (
             <>
-              Used <strong>{usage.used}</strong> / {usage.limit_rpd} requests today ({usage.day} Pacific) —{" "}
-              <strong>{remaining}</strong> left. Resets midnight Pacific.
+              About <strong>{pagesLeft}</strong> invoice pages left today ({usage.day} Pacific) —{" "}
+              {remaining} of {usage.limit_rpd} requests remaining, at up to {usage.pages_per_request} pages per request.
+              Quotas reset at midnight Pacific.
             </>
           )}
         </p>
         <p className="text-xs text-muted-foreground">
-          Free-tier Flash is commonly ~{usage.limit_rpm} requests/minute and ~{usage.limit_rpd ?? 250}/day (confirm in{" "}
-          <a
-            className="underline"
-            href="https://aistudio.google.com/rate-limit"
-            target="_blank"
-            rel="noreferrer"
-          >
+          Free-tier limits are per model ({usage.limit_rpm} requests/minute, {usage.models[0]?.limit_rpd ?? 20}
+          /day each), so OCR automatically falls back to the next model when one runs out. Check exact numbers in{" "}
+          <a className="underline" href="https://aistudio.google.com/rate-limit" target="_blank" rel="noreferrer">
             Google AI Studio → Rate limits
           </a>
-          ). Each PDF page uses about 1 API call (retries use more). A 46-page PDF needs ~46+ calls and several minutes.
+          .
         </p>
         {mayExceed && (
           <p className="text-sm">
-            This upload looks like ~{pages} pages, which may exceed the <strong>{remaining}</strong> requests left today.
-            Split the PDF or wait until the daily reset.
+            This upload looks like ~{pages} pages, more than the ~{pagesLeft} pages left today. Pages beyond the quota
+            will need a re-run after the reset.
           </p>
         )}
         {empty && (
           <p className="text-sm">
-            Daily quota exhausted. Wait for midnight Pacific, raise <code>OCR_GEMINI_RPD_LIMIT</code> to match a paid
-            tier, or enable billing in Google AI Studio.
+            Daily quota is used up on every configured model. Wait for midnight Pacific, add models to{" "}
+            <code>OCR_GEMINI_MODELS</code>, or enable billing in Google AI Studio.
           </p>
         )}
       </AlertDescription>

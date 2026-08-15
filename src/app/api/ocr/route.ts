@@ -1,10 +1,9 @@
 import { assertGeminiBudget } from "@/lib/ocr/gemini-usage";
 import { emptyExtraction } from "@/lib/ocr/parse";
 import { parseLalaInvoice } from "@/lib/ocr/lala-parser";
-import { geminiExtractInline, geminiExtractPageRangeFromFile, geminiExtractPdfByPage } from "@/lib/ocr/gemini";
-import { canRunLocalOcr, rasterizePdf, runLocalOcr } from "@/lib/ocr/local";
+import { GeminiQuotaError, geminiExtractInline, geminiExtractPdfPages } from "@/lib/ocr/gemini";
+import { canRunLocalOcr, runLocalOcr } from "@/lib/ocr/local";
 import { isEmptyExtraction } from "@/lib/ocr/quality";
-import { pdfPageCount } from "@/lib/ocr/split-pdf";
 import { isUsingSupabase } from "@/lib/supabase/config";
 import { requireAdminSupabase } from "@/lib/supabase/admin";
 import type { OcrExtractionResult } from "@/types";
@@ -26,14 +25,11 @@ type OcrResponse = {
   processed_from?: number;
   processed_to?: number;
   next_page?: number | null;
-  gemini_file_uri?: string;
-  gemini_file_name?: string;
+  quota_exhausted?: boolean;
+  model?: string;
 };
 
-function payload(
-  extractions: OcrExtractionResult[],
-  extra: Partial<OcrResponse> = {},
-): OcrResponse {
+function payload(extractions: OcrExtractionResult[], extra: Partial<OcrResponse> = {}): OcrResponse {
   const list = extractions.length ? extractions : [emptyExtraction()];
   const needs = list.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || Boolean(extra.warning);
   return {
@@ -47,8 +43,8 @@ function payload(
     processed_from: extra.processed_from,
     processed_to: extra.processed_to,
     next_page: extra.next_page ?? null,
-    gemini_file_uri: extra.gemini_file_uri,
-    gemini_file_name: extra.gemini_file_name,
+    quota_exhausted: extra.quota_exhausted,
+    model: extra.model,
   };
 }
 
@@ -71,82 +67,46 @@ async function runOcrOnBytes(input: {
   mime: string;
   pageFrom?: number;
   pageTo?: number;
-  geminiFileUri?: string;
-  geminiFileName?: string;
 }): Promise<NextResponse> {
-  const { bytes, fileName, mime, pageFrom, pageTo, geminiFileUri, geminiFileName } = input;
+  const { bytes, fileName, mime, pageFrom, pageTo } = input;
   const isPdf = mime.includes("pdf") || fileName.toLowerCase().endsWith(".pdf");
   const resolvedMime = isPdf ? "application/pdf" : mime || "image/png";
   const apiKey = process.env.GEMINI_API_KEY?.trim();
+  const from = Math.max(1, pageFrom ?? 1);
 
   try {
     if (apiKey) {
-      const pages = isPdf ? await pdfPageCount(bytes).catch(() => 1) : 1;
-      const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 3)));
-      const from = Math.max(1, pageFrom ?? 1);
-      const to = Math.min(pages, pageTo ?? from + chunkSize - 1);
-      const needed = isPdf ? to - from + 1 : 1;
       try {
-        await assertGeminiBudget(needed);
+        await assertGeminiBudget(1);
       } catch (budgetErr) {
         return NextResponse.json(
-          payload([emptyExtraction()], {
+          payload([], {
             engine: "none",
-            warning: budgetErr instanceof Error ? budgetErr.message : "Gemini daily limit reached.",
+            warning: budgetErr instanceof Error ? budgetErr.message : "Gemini daily quota reached.",
             needs_review: true,
-            page_count: pages,
+            quota_exhausted: true,
             processed_from: from,
             processed_to: from - 1,
-            next_page: from,
+            next_page: null,
           }),
         );
       }
 
-      if (isPdf && canRunLocalOcr() && !pageFrom) {
-        try {
-          const pageBuffers = await rasterizePdf(bytes);
-          const results = [];
-          for (const page of pageBuffers) {
-            results.push(await geminiExtractInline(apiKey, page, "image/png", { singlePage: true }));
-          }
-          const extractions = results.flatMap((r) => r.extractions);
-          const warnings = results.map((r) => r.warning).filter((w): w is string => Boolean(w));
-          return NextResponse.json(
-            payload(extractions, {
-              engine: "gemini",
-              warning: warnings[0],
-              warnings,
-              needs_review: extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || warnings.length > 0,
-              page_count: extractions.length,
-              processed_from: 1,
-              processed_to: extractions.length,
-              next_page: null,
-            }),
-          );
-        } catch {
-          // Fall through to Files API / pdf-lib path.
-        }
-      }
-
       if (isPdf) {
-        const result = await geminiExtractPdfByPage(apiKey, bytes, {
-          pageFrom: from,
-          pageTo: to,
-          geminiFileUri,
-          geminiFileName,
-        });
+        const result = await geminiExtractPdfPages(apiKey, bytes, { pageFrom: from, pageTo });
         return NextResponse.json(
           payload(result.extractions, {
             engine: "gemini",
             warning: result.warning,
             warnings: result.warnings,
-            needs_review: result.extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) || Boolean(result.warning),
+            needs_review:
+              result.extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) ||
+              Boolean(result.warning),
             page_count: result.page_count,
             processed_from: result.processed_from,
             processed_to: result.processed_to,
             next_page: result.next_page,
-            gemini_file_uri: result.gemini_file_uri,
-            gemini_file_name: result.gemini_file_name,
+            model: result.model,
           }),
         );
       }
@@ -204,6 +164,19 @@ async function runOcrOnBytes(input: {
       }),
     );
   } catch (err) {
+    if (err instanceof GeminiQuotaError) {
+      return NextResponse.json(
+        payload([], {
+          engine: "none",
+          warning: err.message,
+          needs_review: true,
+          quota_exhausted: true,
+          processed_from: from,
+          processed_to: from - 1,
+          next_page: null,
+        }),
+      );
+    }
     const message = err instanceof Error ? err.message : "OCR failed";
     return NextResponse.json(
       payload([emptyExtraction()], {
@@ -225,63 +198,10 @@ export async function POST(req: Request) {
       file_type?: string;
       page_from?: number;
       page_to?: number;
-      page_count?: number;
-      gemini_file_uri?: string;
-      gemini_file_name?: string;
     } | null;
     const filePath = body?.file_path?.trim();
     if (!filePath) {
       return NextResponse.json({ error: "file_path is required" }, { status: 400 });
-    }
-
-    const apiKey = process.env.GEMINI_API_KEY?.trim();
-    const chunkSize = Math.max(1, Math.min(40, Number(process.env.OCR_PAGE_CHUNK || 3)));
-
-    // Fast path: Gemini file already prepared — no PDF re-download (avoids host timeouts).
-    if (apiKey && body?.gemini_file_uri && body.page_count && body.page_count > 0) {
-      const from = Math.max(1, body.page_from ?? 1);
-      const to = Math.min(body.page_count, body.page_to ?? from + chunkSize - 1);
-      try {
-        await assertGeminiBudget(to - from + 1);
-        const result = await geminiExtractPageRangeFromFile(apiKey, {
-          fileUri: body.gemini_file_uri,
-          fileName: body.gemini_file_name,
-          pageFrom: from,
-          pageTo: to,
-          pageCount: body.page_count,
-        });
-        return NextResponse.json(
-          payload(result.extractions, {
-            engine: "gemini",
-            warning: result.warning,
-            warnings: result.warnings,
-            needs_review:
-              result.extractions.some((e) => e.overall_confidence < 80 || isEmptyExtraction(e)) ||
-              Boolean(result.warning),
-            page_count: result.page_count,
-            processed_from: result.processed_from,
-            processed_to: result.processed_to,
-            next_page: result.next_page,
-            gemini_file_uri: result.gemini_file_uri,
-            gemini_file_name: result.gemini_file_name,
-          }),
-        );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "OCR failed";
-        return NextResponse.json(
-          payload([emptyExtraction()], {
-            engine: "none",
-            warning: `OCR failed (${message}).`,
-            needs_review: true,
-            page_count: body.page_count,
-            processed_from: from,
-            processed_to: from - 1,
-            next_page: from,
-            gemini_file_uri: body.gemini_file_uri,
-            gemini_file_name: body.gemini_file_name,
-          }),
-        );
-      }
     }
 
     try {
@@ -296,8 +216,6 @@ export async function POST(req: Request) {
         mime,
         pageFrom: body?.page_from,
         pageTo: body?.page_to,
-        geminiFileUri: body?.gemini_file_uri,
-        geminiFileName: body?.gemini_file_name,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "OCR failed";
