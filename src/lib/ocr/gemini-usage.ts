@@ -55,7 +55,10 @@ export function pacificDayKey(now = new Date()): string {
  */
 export function geminiModelChain(): string[] {
   const raw = process.env.OCR_GEMINI_MODELS?.trim() || process.env.OCR_GEMINI_MODEL?.trim();
-  const chain = (raw || "gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash")
+  const chain = (
+    raw ||
+    "gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-flash-latest,gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-2.5-flash"
+  )
     .split(",")
     .map((m) => m.trim())
     .filter(Boolean);
@@ -68,8 +71,8 @@ export function geminiModelName() {
 
 /** Pages sent to Gemini in a single request (one request covers a whole batch of invoice pages). */
 export function geminiPagesPerRequest() {
-  const raw = Number(process.env.OCR_PAGE_BATCH || 6);
-  return Math.max(1, Math.min(15, Number.isFinite(raw) && raw > 0 ? raw : 6));
+  const raw = Number(process.env.OCR_PAGE_BATCH || 10);
+  return Math.max(1, Math.min(15, Number.isFinite(raw) && raw > 0 ? raw : 10));
 }
 
 /**

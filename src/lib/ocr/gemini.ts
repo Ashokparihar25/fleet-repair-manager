@@ -30,6 +30,12 @@ function maxOutputTokens() {
   return Math.max(2048, Math.min(65536, Number.isFinite(raw) && raw > 0 ? raw : 32768));
 }
 
+/** A 10-page batch takes ~75s; cap it so an overloaded model can't eat the whole function budget. */
+function requestTimeoutMs() {
+  const raw = Number(process.env.OCR_REQUEST_TIMEOUT_MS || 120_000);
+  return Math.max(30_000, Math.min(240_000, Number.isFinite(raw) && raw > 0 ? raw : 120_000));
+}
+
 function parseGeminiJson(text: string): OcrExtractionResult[] {
   const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
   const raw = JSON.parse(cleaned) as unknown;
@@ -116,12 +122,15 @@ async function geminiGenerate(
   for (const model of models) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
       let res: Response;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), requestTimeoutMs());
       try {
         res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
           body: JSON.stringify({
             system_instruction: { parts: [{ text: OCR_SYSTEM_PROMPT }] },
             contents: [{ role: "user", parts }],
@@ -133,9 +142,17 @@ async function geminiGenerate(
           }),
         });
       } catch (err) {
-        lastErr = err instanceof Error ? err.message : "Network error calling Gemini";
+        const aborted = err instanceof Error && err.name === "AbortError";
+        lastErr = aborted
+          ? `${model} timed out after ${Math.round(requestTimeoutMs() / 1000)}s.`
+          : err instanceof Error
+            ? err.message
+            : "Network error calling Gemini";
+        if (aborted) break; // hand the batch to the next model instead of waiting again
         await sleep(1000 * (attempt + 1));
         continue;
+      } finally {
+        clearTimeout(timer);
       }
 
       if (res.ok) {
@@ -186,8 +203,10 @@ async function geminiGenerate(
         break; // try the next model
       }
       if (res.status >= 500) {
-        lastErr = `Gemini server error (${res.status}) on ${model}.`;
-        await sleep(1000 * Math.pow(2, attempt));
+        // 503 means the model is overloaded — another model will answer sooner than a retry.
+        lastErr = `${model} is busy (${res.status}).`;
+        if (res.status === 503) break;
+        await sleep(1000 * (attempt + 1));
         continue;
       }
 
@@ -300,47 +319,71 @@ export async function geminiExtractPdfPages(
   const pageTo = batch[batch.length - 1]?.page ?? pageFrom;
   const count = batch.length;
 
-  const parts: Array<Record<string, unknown>> = [
-    {
-      text:
-        `You are given ${count} single-page invoice PDFs, labeled PAGE ${pageFrom} through PAGE ${pageTo} (they are pages ${pageFrom}-${pageTo} of a ${totalPages}-page scan). ` +
-        `Return JSON {"invoices":[...]} containing EXACTLY ${count} objects, one per attached page, in the same order. ` +
-        `Add a "page" property to each object with its page number. Every object must follow the invoice schema. ` +
-        `Never skip or merge pages: if a page is blank or unreadable, still return its object with null fields and overall_confidence 0. ` +
-        `Keep parts and labor as separate arrays, and always extract the VIN when printed.`,
-    },
-  ];
-  for (const item of batch) {
-    parts.push({ text: `PAGE ${item.page}:` });
-    parts.push({ inline_data: { mime_type: "application/pdf", data: item.bytes.toString("base64") } });
-  }
+  async function runBatch(items: Array<{ page: number; bytes: Buffer }>) {
+    const pageList = items.map((i) => i.page).join(", ");
+    const parts: Array<Record<string, unknown>> = [
+      {
+        text:
+          `You are given ${items.length} single-page invoice PDFs from a ${totalPages}-page scan, labeled with their page numbers (${pageList}). ` +
+          `Return JSON {"invoices":[...]} containing EXACTLY ${items.length} objects, one per attached page, in the same order. ` +
+          `Add a "page" property to each object with its page number. Every object must follow the invoice schema. ` +
+          `Never skip or merge pages: if a page is blank or unreadable, still return its object with null fields and overall_confidence 0. ` +
+          `Keep parts and labor as separate arrays, and always extract the VIN when printed.`,
+      },
+    ];
+    for (const item of items) {
+      parts.push({ text: `PAGE ${item.page}:` });
+      parts.push({ inline_data: { mime_type: "application/pdf", data: item.bytes.toString("base64") } });
+    }
 
-  const { text, warning, model } = await geminiGenerate(apiKey, parts);
+    const { text, warning, model } = await geminiGenerate(apiKey, parts);
+    const found = new Map<number, OcrExtractionResult>();
+    if (!text) return { found, warning: warning || "Gemini returned no text.", model };
 
-  let byPage = new Map<number, OcrExtractionResult>();
-  let parseWarning = warning;
-
-  if (text) {
     try {
       const parsed = parseGeminiJson(text);
       const labels = parsePageLabels(text);
+      const allowed = new Set(items.map((i) => i.page));
       parsed.forEach((extraction, i) => {
         const label = labels[i];
-        const page = label != null && label >= pageFrom && label <= pageTo ? label : batch[i]?.page;
-        if (page != null && !byPage.has(page)) byPage.set(page, extraction);
+        const page = label != null && allowed.has(label) ? label : items[i]?.page;
+        if (page != null && !found.has(page)) found.set(page, extraction);
       });
+      return { found, warning, model };
     } catch {
-      byPage = new Map();
-      parseWarning = "Gemini returned unparseable JSON for this batch.";
+      return { found, warning: "Gemini returned unparseable JSON for this batch.", model };
     }
   }
 
-  // Retry stragglers one page at a time — usually 0, and capped so quota can't drain.
-  const missing = batch.filter((item) => {
-    const got = byPage.get(item.page);
-    return !got || isEmptyExtraction(got);
-  });
-  const retryLimit = Math.max(0, Math.min(3, Number(process.env.OCR_PAGE_RETRY_LIMIT ?? 2)));
+  const first = await runBatch(batch);
+  const byPage = first.found;
+  let parseWarning = first.warning;
+  const model = first.model;
+
+  const stillMissing = () =>
+    batch.filter((item) => {
+      const got = byPage.get(item.page);
+      return !got || isEmptyExtraction(got);
+    });
+
+  // A partial answer usually means the model dropped pages, not that they are blank.
+  // Re-ask for just those pages as one batch, then one-by-one for anything left.
+  let missing = stillMissing();
+  if (missing.length && missing.length < count) {
+    await sleep(geminiPaceDelayMs());
+    try {
+      const second = await runBatch(missing);
+      for (const [page, extraction] of second.found) {
+        if (!isEmptyExtraction(extraction)) byPage.set(page, extraction);
+      }
+      if (second.found.size) parseWarning = undefined;
+    } catch (err) {
+      if (!(err instanceof GeminiQuotaError)) throw err;
+    }
+  }
+
+  missing = stillMissing();
+  const retryLimit = Math.max(0, Math.min(5, Number(process.env.OCR_PAGE_RETRY_LIMIT ?? 3)));
   for (const item of missing.slice(0, retryLimit)) {
     await sleep(geminiPaceDelayMs());
     try {

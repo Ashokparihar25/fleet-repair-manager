@@ -47,7 +47,7 @@ export function GeminiUsageBanner({ estimatedPages }: { estimatedPages?: number 
         limit_rpm: 10,
         model: "gemini-3.7-flash",
         models: [],
-        pages_per_request: 6,
+        pages_per_request: 10,
         pages_remaining: null,
         rate_limit_hits: 0,
         configured: false,

@@ -242,7 +242,7 @@ export function UploadWorkflow({
         const chunkFrom = nextPage;
         update(id, {
           message: totalPages
-            ? `Reading pages ${nextPage}–${Math.min(totalPages, nextPage + (prep.pages_per_request ?? 6) - 1)} of ${totalPages}…`
+            ? `Reading pages ${nextPage}–${Math.min(totalPages, nextPage + (prep.pages_per_request ?? 10) - 1)} of ${totalPages}…`
             : `Reading from page ${nextPage}…`,
         });
 

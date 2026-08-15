@@ -92,7 +92,7 @@ export default async function SettingsPage() {
               <a className="text-primary underline" href="https://aistudio.google.com/rate-limit" target="_blank" rel="noreferrer">
                 AI Studio → Rate limits
               </a>
-              ). OCR batches up to {process.env.OCR_PAGE_BATCH || "6"} invoice pages into one request and falls back to
+              ). OCR batches up to {process.env.OCR_PAGE_BATCH || "10"} invoice pages into one request and falls back to
               the next model in the list when a quota runs out. Quotas reset at midnight Pacific.
             </p>
             <p>
@@ -102,9 +102,9 @@ export default async function SettingsPage() {
             <Row label="GEMINI_API_KEY" value={process.env.GEMINI_API_KEY ? "Configured" : "Missing"} />
             <Row
               label="Models"
-              value={process.env.OCR_GEMINI_MODELS || "gemini-3.7-flash, gemini-3.5-flash, gemini-2.5-flash"}
+              value={process.env.OCR_GEMINI_MODELS || "gemini-3.7-flash, gemini-3.6-flash, gemini-3.5-flash, …"}
             />
-            <Row label="Pages per request" value={process.env.OCR_PAGE_BATCH || "6"} />
+            <Row label="Pages per request" value={process.env.OCR_PAGE_BATCH || "10"} />
             <Row label="Daily limit per model (app)" value={process.env.OCR_GEMINI_RPD_LIMIT || "20"} />
             <Row label="RPM pace (app)" value={process.env.OCR_GEMINI_RPM_LIMIT || "10"} />
           </CardContent>

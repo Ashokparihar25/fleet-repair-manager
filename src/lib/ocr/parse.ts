@@ -8,6 +8,14 @@ function num(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/** Models sometimes return 0–1 fractions; the UI expects 0–100. */
+function confidencePercent(v: unknown, fallback: number): number {
+  const n = num(v);
+  if (n == null) return fallback;
+  if (n > 0 && n <= 1) return Math.round(n * 100);
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
 function str(v: unknown): string | null {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
@@ -63,8 +71,12 @@ export function normalizeExtraction(raw: unknown, overallFallback = 50): OcrExtr
   const inv = (r.invoice ?? {}) as Record<string, unknown>;
   const veh = (r.vehicle ?? {}) as Record<string, unknown>;
   const tech = (r.technician ?? {}) as Record<string, unknown>;
-  const conf = (r.field_confidence ?? {}) as Record<string, number>;
-  const overall = num(r.overall_confidence) ?? overallFallback;
+  const confRaw = (r.field_confidence ?? {}) as Record<string, unknown>;
+  const overall = confidencePercent(r.overall_confidence, overallFallback);
+  const conf: Record<string, number> = {};
+  for (const [key, value] of Object.entries(confRaw)) {
+    conf[key] = confidencePercent(value, overall);
+  }
 
   const vinSource = str(inv.vin) ?? str(veh.vin);
   const vinNorm = normalizeVin(vinSource);
